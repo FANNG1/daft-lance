@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import pathlib
-import warnings
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -434,11 +433,10 @@ def update_columns_df(
     Returns:
         The committed dataset version and exact number of updated live rows.
 
-    Warning:
-        On datasets with stable row IDs, values are updated but the current
-        pylance transaction binding does not propagate updated fragment offsets.
-        Consequently ``_row_last_updated_at_version`` is not advanced and CDF
-        consumers cannot observe this update.
+    Raises:
+        NotImplementedError: If the target dataset uses stable row IDs. The
+            current pylance transaction binding cannot propagate the updated
+            fragment offsets required for correct CDF metadata.
 
     Examples:
         >>> import daft
@@ -468,13 +466,10 @@ def update_columns_df(
         commit_lock=commit_lock,
     )
     if dataset_handle.dataset.has_stable_row_ids:
-        warnings.warn(
-            "update_columns_df updates values on datasets with stable row IDs, but "
-            "_row_last_updated_at_version is not advanced because pylance does not "
-            "yet expose updated fragment offsets. CDF consumers will not observe "
-            "this update.",
-            RuntimeWarning,
-            stacklevel=2,
+        raise NotImplementedError(
+            "update_columns_df does not support datasets with stable row IDs: "
+            "pylance does not yet expose updated fragment offsets, so "
+            "_row_last_updated_at_version and CDF metadata cannot be updated correctly."
         )
 
     return update_columns_from_df(
@@ -482,6 +477,7 @@ def update_columns_df(
         dataset_handle.dataset,
         dataset_handle.worker_open_context(),
         columns=columns,
+        commit_lock=commit_lock,
         max_concurrency=max_concurrency,
     )
 

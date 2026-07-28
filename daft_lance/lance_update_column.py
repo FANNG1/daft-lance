@@ -224,6 +224,7 @@ def update_columns_from_df(
     open_context: DatasetOpenContext,
     *,
     columns: Sequence[str],
+    commit_lock: Any | None = None,
     max_concurrency: int | None = None,
 ) -> UpdateColumnsResult:
     """Execute a distributed, DataFrame-driven RewriteColumns transaction."""
@@ -283,6 +284,7 @@ def update_columns_from_df(
         open_context.uri,
         operation,
         read_version=lance_ds.version,
+        commit_lock=commit_lock,
         storage_options=open_context.storage_options,
         **open_context.commit_kwargs,
     )
