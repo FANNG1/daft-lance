@@ -403,11 +403,7 @@ def update_columns_df(
     namespace_properties: dict[str, str] | None = None,
     storage_options: dict[str, Any] | None = None,
     version: int | str | None = None,
-    asof: str | None = None,
-    block_size: int | None = None,
     commit_lock: Any | None = None,
-    index_cache_size: int | None = None,
-    metadata_cache_size_bytes: int | None = None,
     max_concurrency: int | None = None,
 ) -> UpdateColumnsResult:
     """Overwrite existing Lance columns using values from a Daft DataFrame.
@@ -432,11 +428,7 @@ def update_columns_df(
         namespace_properties: Properties used to connect to the namespace.
         storage_options: Additional object-store options.
         version: Target dataset version or tag. Defaults to the current version.
-        asof: Resolve the target version as of this timestamp.
-        block_size: Minimal object-store read block size.
         commit_lock: Custom Lance commit lock.
-        index_cache_size: Lance index cache size.
-        metadata_cache_size_bytes: Lance metadata cache size.
         max_concurrency: Maximum number of fragment-update worker processes.
 
     Returns:
@@ -473,11 +465,7 @@ def update_columns_df(
         namespace_properties=namespace_properties,
         table_id=table_id,
         version=version,
-        asof=asof,
-        block_size=block_size,
         commit_lock=commit_lock,
-        index_cache_size=index_cache_size,
-        metadata_cache_size_bytes=metadata_cache_size_bytes,
     )
     if dataset_handle.dataset.has_stable_row_ids:
         warnings.warn(
