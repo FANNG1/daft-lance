@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, cast
@@ -170,7 +171,7 @@ def test_update_columns_df_safe_casts_to_target_type(tmp_path: Path) -> None:
     assert table.column("value").to_pylist() == [123, 123]
 
 
-def test_update_columns_df_warns_for_stable_row_ids(tmp_path: Path) -> None:
+def test_update_columns_df_rejects_stable_row_ids_before_writing(tmp_path: Path) -> None:
     path = str(tmp_path / "stable-row-ids.lance")
     lance.write_dataset(
         pa.table({"id": [1, 2], "value": [10, 20]}),
@@ -178,16 +179,41 @@ def test_update_columns_df_warns_for_stable_row_ids(tmp_path: Path) -> None:
         enable_stable_row_ids=True,
     )
     source = _read_update_source(path).with_column("value", daft.col("value") + 1)
-    version_columns = ["id", "_row_created_at_version", "_row_last_updated_at_version"]
-    before_versions = lance.dataset(path).scanner(columns=version_columns).to_table().sort_by("id").to_pydict()
+    before = lance.dataset(path)
+    before_version = before.version
+    before_values = before.to_table().column("value").to_pylist()
 
-    with pytest.warns(RuntimeWarning, match="CDF consumers will not observe"):
-        result = daft_lance.update_columns_df(source, path, columns=["value"])
+    with pytest.raises(NotImplementedError, match="does not support datasets with stable row IDs"):
+        daft_lance.update_columns_df(source, path, columns=["value"])
 
-    assert result.rows_updated == 2
-    assert lance.dataset(path).to_table().column("value").to_pylist() == [11, 21]
-    after_versions = lance.dataset(path).scanner(columns=version_columns).to_table().sort_by("id").to_pydict()
-    assert after_versions == before_versions
+    after = lance.dataset(path)
+    assert after.version == before_version
+    assert after.to_table().column("value").to_pylist() == before_values
+
+
+def test_update_columns_df_uses_commit_lock(tmp_path: Path) -> None:
+    path = str(tmp_path / "commit-lock.lance")
+    daft.from_pydict({"id": [1], "value": [10]}).write_lance(path)
+    source = _read_update_source(path).with_column("value", daft.lit(20))
+    before_version = lance.dataset(path).version
+    lock_calls: list[int] = []
+    lock_released = False
+
+    @contextlib.contextmanager
+    def commit_lock(version: int) -> Iterator[None]:
+        nonlocal lock_released
+        lock_calls.append(version)
+        try:
+            yield
+        finally:
+            lock_released = True
+
+    result = daft_lance.update_columns_df(source, path, columns=["value"], commit_lock=commit_lock)
+
+    assert lock_calls
+    assert lock_released
+    assert result.version == before_version + 1
+    assert lance.dataset(path).to_table().column("value").to_pylist() == [20]
 
 
 def test_update_columns_df_rejects_deleted_row_address(tmp_path: Path) -> None:

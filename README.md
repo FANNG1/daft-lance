@@ -90,9 +90,9 @@ print(result.version, result.rows_updated)
 
 The source `_rowaddr` values must all be unique live rows in the pinned target
 snapshot. The update is committed atomically using Lance `RewriteColumns`.
-On stable-row-ID datasets the values are updated, but `daft-lance` warns that
-current pylance bindings do not advance `_row_last_updated_at_version`, so CDF
-consumers cannot observe the update.
+Stable-row-ID datasets are rejected before any fragments are written because
+current pylance bindings cannot propagate the offsets required to advance
+`_row_last_updated_at_version` and keep CDF metadata correct.
 
 ### Namespace Tables
 
