@@ -15,18 +15,15 @@ from daft.udf import method
 from daft_lance._blob import is_blob_v2_field
 
 if TYPE_CHECKING:
-    from daft.dependencies import pa
     from daft_lance.namespace import DatasetOpenContext
 
 
 _ROW_ADDRESS = "_rowaddr"
 _FRAGMENT_ID = "fragment_id"
 _METADATA_COLUMNS = {_ROW_ADDRESS, "_rowid", _FRAGMENT_ID}
-_UPDATE_HANDLER_RETURN_DTYPE = DataType.struct(
+_FRAGMENT_UPDATE_RESULT_DTYPE = DataType.struct(
     {
-        "fragment_id": DataType.int64(),
         "fragment_meta": DataType.binary(),
-        "fields_modified": DataType.binary(),
         "rows_updated": DataType.int64(),
     }
 )
@@ -38,6 +35,15 @@ class UpdateColumnsResult:
 
     version: int
     rows_updated: int
+
+
+@dataclass(frozen=True)
+class _FragmentUpdateBatch:
+    """Arrow inputs for one fragment update."""
+
+    fragment_id: int
+    row_addresses: pa.Array[Any]
+    values: pa.Table
 
 
 def _is_blob_field(field: pa.Field[Any]) -> bool:
@@ -121,6 +127,103 @@ def _to_arrow_array(series: Any) -> pa.Array[Any]:
     return cast("pa.Array[Any]", array)
 
 
+def _prepare_fragment_update(columns: list[str], series: tuple[Any, ...]) -> _FragmentUpdateBatch:
+    """Validate and convert one Daft fragment group into Arrow inputs."""
+    expected_inputs = len(columns) + 2
+    if len(series) != expected_inputs:
+        raise ValueError(f"Expected {expected_inputs} update inputs, received {len(series)}.")
+
+    *update_series, row_address_series, fragment_id_series = series
+    fragment_ids = _to_arrow_array(fragment_id_series)
+    if fragment_ids.null_count:
+        raise ValueError("fragment_id cannot contain nulls.")
+    fragment_ids = fragment_ids.cast(pa.int64(), safe=True)
+    fragment_id = int(fragment_ids[0].as_py())
+
+    row_addresses = _to_arrow_array(row_address_series)
+    if row_addresses.null_count:
+        raise ValueError("_rowaddr cannot contain nulls.")
+    row_addresses = row_addresses.cast(pa.uint64(), safe=True)
+    if pa.compute.count_distinct(row_addresses).as_py() != len(row_addresses):
+        raise ValueError(f"Duplicate _rowaddr values found for fragment {fragment_id}.")
+
+    values = pa.Table.from_arrays([_to_arrow_array(value) for value in update_series], names=columns)
+    return _FragmentUpdateBatch(fragment_id, row_addresses, values)
+
+
+def _validate_live_row_addresses(
+    fragment: Any,
+    row_addresses: pa.Array[Any],
+    *,
+    fragment_id: int,
+    version: int,
+) -> None:
+    """Require every requested address to identify a live row in the pinned fragment."""
+    live_row_addresses = (
+        fragment.scanner(columns=[], with_row_address=True).to_table().column(_ROW_ADDRESS).combine_chunks()
+    )
+    addresses_are_live = pa.compute.is_in(row_addresses, value_set=live_row_addresses)
+    if bool(pa.compute.all(addresses_are_live).as_py()):
+        return
+
+    invalid = row_addresses.filter(pa.compute.invert(addresses_are_live)).to_pylist()
+    preview = invalid[:10]
+    suffix = "..." if len(invalid) > len(preview) else ""
+    raise ValueError(
+        f"Source contains _rowaddr values that are not live rows in fragment {fragment_id} "
+        f"at version {version}: {preview}{suffix}"
+    )
+
+
+def _rewrite_fragment(
+    lance_ds: lance.LanceDataset,
+    batch: _FragmentUpdateBatch,
+    *,
+    columns: list[str],
+    expected_field_ids: list[int],
+) -> dict[str, Any]:
+    """Validate and rewrite one fragment, returning a minimal driver commit message."""
+    fragment = lance_ds.get_fragment(batch.fragment_id)
+    if fragment is None:
+        raise ValueError(f"Fragment {batch.fragment_id} does not exist in target snapshot version {lance_ds.version}.")
+
+    _validate_live_row_addresses(
+        fragment,
+        batch.row_addresses,
+        fragment_id=batch.fragment_id,
+        version=lance_ds.version,
+    )
+
+    target_schema = pa.schema([lance_ds.schema.field(name) for name in columns])
+    for field in target_schema:
+        if not field.nullable and batch.values.column(field.name).null_count:
+            raise ValueError(f"Update produced nulls for non-nullable column {field.name!r}.")
+    try:
+        values = batch.values.cast(target_schema, safe=True)
+    except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError) as exc:
+        raise ValueError(f"Update columns cannot be safely cast to the target Lance schema: {exc}") from exc
+
+    update_table = values.append_column(_ROW_ADDRESS, batch.row_addresses)
+    fragment_meta, fields_modified = fragment.update_columns(
+        update_table,
+        left_on=_ROW_ADDRESS,
+        right_on=_ROW_ADDRESS,
+    )
+    if int(fragment_meta.id) != batch.fragment_id:
+        raise ValueError(f"Fragment rewrite changed fragment id: expected {batch.fragment_id}, got {fragment_meta.id}.")
+
+    observed_field_ids = sorted(fields_modified)
+    if observed_field_ids != expected_field_ids:
+        raise ValueError(
+            f"Modified field ids {observed_field_ids} do not match target column field ids {expected_field_ids}."
+        )
+
+    return {
+        "fragment_meta": daft.pickle.dumps(fragment_meta),
+        "rows_updated": len(batch.row_addresses),
+    }
+
+
 class _FragmentUpdateHandler:
     """Rewrite existing columns for one pinned Lance fragment."""
 
@@ -128,87 +231,31 @@ class _FragmentUpdateHandler:
         self,
         open_context: DatasetOpenContext,
         columns: list[str],
+        expected_field_ids: list[int],
     ) -> None:
         self.open_context = open_context
         self.columns = columns
+        self.expected_field_ids = expected_field_ids
+        self._lance_ds: lance.LanceDataset | None = None
 
     def _dataset(self) -> lance.LanceDataset:
-        # Reopen the pinned snapshot for each group instead of retaining a
-        # write-capable native handle on the long-lived Daft UDF instance.
-        return self.open_context.open_pinned()
+        if self._lance_ds is None:
+            self._lance_ds = self.open_context.open_pinned()
+        return self._lance_ds
 
-    @method.batch(return_dtype=_UPDATE_HANDLER_RETURN_DTYPE)
+    @method.batch(return_dtype=_FRAGMENT_UPDATE_RESULT_DTYPE)
     def __call__(self, *series: Any) -> list[dict[str, Any]]:
-        from daft.dependencies import pa
-
         if not series or len(series[0]) == 0:
             return []
 
-        expected_inputs = len(self.columns) + 2
-        if len(series) != expected_inputs:
-            raise ValueError(f"Expected {expected_inputs} update inputs, received {len(series)}.")
-
-        *update_series, row_address_series, fragment_id_series = series
-        fragment_ids = _to_arrow_array(fragment_id_series)
-        if fragment_ids.null_count:
-            raise ValueError("fragment_id cannot contain nulls.")
-        fragment_ids = fragment_ids.cast(pa.int64(), safe=True)
-        unique_fragment_ids = pa.compute.unique(fragment_ids).to_pylist()
-        if len(unique_fragment_ids) != 1:
-            raise ValueError(f"Each update group must contain one fragment_id, got {unique_fragment_ids}.")
-        fragment_value = unique_fragment_ids[0]
-        if fragment_value is None:
-            raise ValueError("fragment_id cannot contain nulls.")
-        fragment_id = int(fragment_value)
-
-        lance_ds = self._dataset()
-        fragment = lance_ds.get_fragment(fragment_id)
-        if fragment is None:
-            raise ValueError(f"Fragment {fragment_id} does not exist in target snapshot version {lance_ds.version}.")
-
-        row_addresses = _to_arrow_array(row_address_series)
-        if row_addresses.null_count:
-            raise ValueError("_rowaddr cannot contain nulls.")
-        row_addresses = row_addresses.cast(pa.uint64(), safe=True)
-        if pa.compute.count_distinct(row_addresses).as_py() != len(row_addresses):
-            raise ValueError(f"Duplicate _rowaddr values found for fragment {fragment_id}.")
-
-        live_row_addresses = (
-            fragment.scanner(columns=[], with_row_address=True).to_table().column(_ROW_ADDRESS).combine_chunks()
-        )
-        addresses_are_live = pa.compute.is_in(row_addresses, value_set=live_row_addresses)
-        if not bool(pa.compute.all(addresses_are_live).as_py()):
-            invalid = row_addresses.filter(pa.compute.invert(addresses_are_live)).to_pylist()
-            preview = invalid[:10]
-            suffix = "..." if len(invalid) > len(preview) else ""
-            raise ValueError(
-                f"Source contains _rowaddr values that are not live rows in fragment {fragment_id} "
-                f"at version {lance_ds.version}: {preview}{suffix}"
-            )
-
-        target_schema = pa.schema([lance_ds.schema.field(name) for name in self.columns])
-        update_table = pa.Table.from_arrays([_to_arrow_array(value) for value in update_series], names=self.columns)
-        for field in target_schema:
-            if not field.nullable and update_table.column(field.name).null_count:
-                raise ValueError(f"Update produced nulls for non-nullable column {field.name!r}.")
-        try:
-            update_table = update_table.cast(target_schema, safe=True)
-        except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError) as exc:
-            raise ValueError(f"Update columns cannot be safely cast to the target Lance schema: {exc}") from exc
-
-        update_table = update_table.append_column(_ROW_ADDRESS, row_addresses)
-        fragment_meta, fields_modified = fragment.update_columns(
-            update_table,
-            left_on=_ROW_ADDRESS,
-            right_on=_ROW_ADDRESS,
-        )
+        batch = _prepare_fragment_update(self.columns, series)
         return [
-            {
-                "fragment_id": fragment_id,
-                "fragment_meta": daft.pickle.dumps(fragment_meta),
-                "fields_modified": daft.pickle.dumps(list(fields_modified)),
-                "rows_updated": len(row_addresses),
-            }
+            _rewrite_fragment(
+                self._dataset(),
+                batch,
+                columns=self.columns,
+                expected_field_ids=self.expected_field_ids,
+            )
         ]
 
 
@@ -235,7 +282,7 @@ def update_columns_from_df(
     source = df.select(*resolved_columns, _ROW_ADDRESS, _FRAGMENT_ID)
 
     handler_cls = _fragment_update_handler_cls(max_concurrency)
-    handler = handler_cls(open_context, resolved_columns)
+    handler = handler_cls(open_context, resolved_columns, expected_field_ids)
     grouped = source.groupby(_FRAGMENT_ID).map_groups(
         handler(
             *(source[name] for name in resolved_columns),
@@ -249,34 +296,20 @@ def update_columns_from_df(
 
     updated_fragments = []
     seen_fragment_ids: set[int] = set()
-    observed_field_ids: list[int] | None = None
     rows_updated = 0
     for message in commit_messages:
-        fragment_id = int(message["fragment_id"])
+        fragment_meta = daft.pickle.loads(message["fragment_meta"])
+        fragment_id = int(fragment_meta.id)
         if fragment_id in seen_fragment_ids:
             raise ValueError(f"Duplicate update result for fragment {fragment_id}.")
         seen_fragment_ids.add(fragment_id)
 
-        fragment_meta = daft.pickle.loads(message["fragment_meta"])
-        if int(fragment_meta.id) != fragment_id:
-            raise ValueError(f"Fragment rewrite changed fragment id: expected {fragment_id}, got {fragment_meta.id}.")
         updated_fragments.append(fragment_meta)
         rows_updated += int(message["rows_updated"])
 
-        worker_field_ids = sorted(daft.pickle.loads(message["fields_modified"]))
-        if observed_field_ids is None:
-            observed_field_ids = worker_field_ids
-        elif observed_field_ids != worker_field_ids:
-            raise ValueError(f"Workers disagree on modified field ids: {observed_field_ids} vs {worker_field_ids}.")
-
-    if observed_field_ids != expected_field_ids:
-        raise ValueError(
-            f"Modified field ids {observed_field_ids} do not match target column field ids {expected_field_ids}."
-        )
-
     operation = lance.LanceOperation.Update(
         updated_fragments=updated_fragments,
-        fields_modified=observed_field_ids,
+        fields_modified=expected_field_ids,
         fields_for_preserving_frag_bitmap=[],
         update_mode="rewrite_columns",
     )
