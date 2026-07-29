@@ -11,6 +11,7 @@ import pytest
 import daft
 import daft_lance
 from daft.dependencies import pa
+from daft_lance.lance_update_column import _FragmentUpdateHandler
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -28,6 +29,25 @@ def _read_update_source(path: str) -> daft.DataFrame:
         default_scan_options={"with_row_address": True},
         include_fragment_id=True,
     )
+
+
+def test_fragment_update_handler_reuses_pinned_dataset() -> None:
+    dataset = object()
+
+    class OpenContext:
+        def __init__(self) -> None:
+            self.opens = 0
+
+        def open_pinned(self) -> Any:
+            self.opens += 1
+            return dataset
+
+    open_context = OpenContext()
+    handler = _FragmentUpdateHandler(cast(Any, open_context), ["value"], [1])
+
+    assert handler._dataset() is dataset
+    assert handler._dataset() is dataset
+    assert open_context.opens == 1
 
 
 def test_update_columns_df_partial_multi_fragment(tmp_path: Path) -> None:
