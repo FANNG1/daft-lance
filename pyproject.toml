@@ -36,7 +36,7 @@ warn_unused_configs = true
 
 [tool.pytest.ini_options]
 markers = [
-  "integration: requires explicitly provisioned external services or runtimes",
+  "integration: requires explicitly provisioned external services or runtimes"
 ]
 
 [build-system]
