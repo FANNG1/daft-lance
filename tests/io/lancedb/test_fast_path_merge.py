@@ -1,4 +1,4 @@
-"""Extensive tests for the native-reader fast path used by merge_columns_df.
+"""Extensive tests for the positional fast path used by merge_columns_df.
 
 The fast path passes positionally aligned new columns to
 LanceFragment.merge_columns. These tests cover correctness, ordering,
@@ -16,7 +16,7 @@ import pyarrow as pa
 import pytest
 
 import daft
-from daft_lance.lance_merge_column import _is_native_reader_candidate, merge_columns_from_df
+from daft_lance.lance_merge_column import _is_positional_merge_candidate, merge_columns_from_df
 from daft_lance.namespace import DatasetOpenContext
 
 # ---------------------------------------------------------------------------
@@ -258,14 +258,14 @@ class TestAutoDetection:
         ds = create_dataset(ds_path, [{"id": [1, 2]}])
         df = read_with_metadata(ds_path)
         df = df.with_column("new", daft.lit(1))
-        assert _is_native_reader_candidate(df, ds, "_rowaddr") is True
+        assert _is_positional_merge_candidate(df, ds, "_rowaddr") is True
 
     def test_falls_back_without_rowaddr(self, ds_path):
         ds = create_dataset(ds_path, [{"id": [1, 2], "val": [10, 20]}])
         # Read WITHOUT _rowaddr — fast path should not be used
         df = daft.read_lance(ds_path, include_fragment_id=True)
         df = df.with_column("doubled", daft.col("val").cast(daft.DataType.int64()) * 2)
-        assert _is_native_reader_candidate(df, ds, "_rowaddr") is False
+        assert _is_positional_merge_candidate(df, ds, "_rowaddr") is False
 
     def test_falls_back_with_business_key(self, ds_path):
         ds = create_dataset(ds_path, [{"id": [1, 2], "val": [10, 20]}])
@@ -275,33 +275,33 @@ class TestAutoDetection:
             default_scan_options={"with_row_address": True},
         )
         df = df.with_column("doubled", daft.col("val").cast(daft.DataType.int64()) * 2)
-        assert _is_native_reader_candidate(df, ds, "id") is False
+        assert _is_positional_merge_candidate(df, ds, "id") is False
 
     def test_falls_back_when_rows_filtered(self, ds_path):
         ds = create_dataset(ds_path, [{"id": [1, 2, 3, 4], "val": [10, 20, 30, 40]}])
         df = read_with_metadata(ds_path)
         df = df.where(daft.col("id") > 2)
         df = df.with_column("new", daft.lit(1))
-        assert _is_native_reader_candidate(df, ds, "_rowaddr") is False
+        assert _is_positional_merge_candidate(df, ds, "_rowaddr") is False
 
     def test_fast_path_flag_is_correct(self, ds_path):
         ds = create_dataset(ds_path, [{"id": [1, 2]}])
         # With _rowaddr + fragment_id + full rows → True
         df_full = read_with_metadata(ds_path).with_column("x", daft.lit(1))
-        assert _is_native_reader_candidate(df_full, ds, "_rowaddr") is True
+        assert _is_positional_merge_candidate(df_full, ds, "_rowaddr") is True
 
         # Without _rowaddr → False
         df_no_addr = daft.read_lance(ds_path, include_fragment_id=True).with_column("x", daft.lit(1))
-        assert _is_native_reader_candidate(df_no_addr, ds, "_rowaddr") is False
+        assert _is_positional_merge_candidate(df_no_addr, ds, "_rowaddr") is False
 
         # Without fragment_id → False
         df_no_frag = daft.read_lance(ds_path, default_scan_options={"with_row_address": True}).with_column(
             "x", daft.lit(1)
         )
-        assert _is_native_reader_candidate(df_no_frag, ds, "_rowaddr") is False
+        assert _is_positional_merge_candidate(df_no_frag, ds, "_rowaddr") is False
 
         # Non-_rowaddr join key → False
-        assert _is_native_reader_candidate(df_full, ds, "id") is False
+        assert _is_positional_merge_candidate(df_full, ds, "id") is False
 
 
 # ---------------------------------------------------------------------------
@@ -475,7 +475,7 @@ class TestEdgeCases:
         assert ds2.version == v_before + 1
 
     @pytest.mark.parametrize("data_storage_version", ["2.1", "2.2"])
-    def test_native_reader_matches_dataset_storage_version(self, ds_path, data_storage_version):
+    def test_aligned_merge_matches_dataset_storage_version(self, ds_path, data_storage_version):
         lance.write_dataset(
             pa.table({"id": [1, 2, 3]}),
             ds_path,
@@ -612,7 +612,7 @@ class TestReadBackIntegrity:
 
 
 class TestRegressions:
-    def test_native_reader_preserves_deletion_vectors(self, ds_path):
+    def test_aligned_merge_preserves_deletion_vectors(self, ds_path):
         ds = create_dataset(
             ds_path,
             [
@@ -625,7 +625,7 @@ class TestRegressions:
         assert all(fragment.metadata.deletion_file is not None for fragment in ds.get_fragments())
 
         df = read_with_metadata(ds_path).with_column("score", daft.col("id") * 10)
-        assert _is_native_reader_candidate(df, ds, "_rowaddr") is True
+        assert _is_positional_merge_candidate(df, ds, "_rowaddr") is True
 
         merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
         reopened = lance.dataset(ds_path)
@@ -635,7 +635,7 @@ class TestRegressions:
         assert result["score"] == [0, 20, 30, 40, 50, 70]
         assert all(fragment.metadata.deletion_file is not None for fragment in reopened.get_fragments())
 
-    def test_native_reader_handles_fully_deleted_untouched_fragment(self, ds_path):
+    def test_aligned_merge_handles_fully_deleted_untouched_fragment(self, ds_path):
         ds = create_dataset(
             ds_path,
             [
@@ -681,7 +681,7 @@ class TestRegressions:
                 "score": [value * 10 for value in source["id"]],
             }
         )
-        assert _is_native_reader_candidate(df, ds, "_rowaddr") is True
+        assert _is_positional_merge_candidate(df, ds, "_rowaddr") is True
 
         with pytest.raises(ValueError, match="requires exact visible _rowaddr alignment"):
             merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
@@ -698,7 +698,7 @@ class TestRegressions:
                 "score": [0, 10, 999],
             }
         )
-        assert _is_native_reader_candidate(df, ds, "_rowaddr") is True
+        assert _is_positional_merge_candidate(df, ds, "_rowaddr") is True
 
         with pytest.raises(ValueError, match="requires exact visible _rowaddr alignment"):
             merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
@@ -717,7 +717,7 @@ class TestRegressions:
         df = read_with_metadata(ds_path).with_column("x", daft.lit(1))
 
         assert getattr(df, "_result_cache", None) is None, "cache should start empty"
-        result = _is_native_reader_candidate(df, ds, "_rowaddr")
+        result = _is_positional_merge_candidate(df, ds, "_rowaddr")
         assert result is True
         # count_rows() must not populate _result_cache; collect() would have done so
         assert getattr(df, "_result_cache", None) is None, (
@@ -757,7 +757,7 @@ class TestRegressions:
             for v in emb:
                 assert pytest.approx(float(i), rel=1e-5) == v
 
-    def test_native_reader_assigns_field_ids_after_nested_fields(self, ds_path):
+    def test_reader_merge_assigns_field_ids_after_nested_fields(self, ds_path):
         """Lance assigns new field IDs without colliding with nested child IDs."""
         struct_type = pa.struct([("a", pa.int64()), ("b", pa.utf8())])
         rows = [{"a": i, "b": f"s{i}"} for i in [1, 2, 3]]

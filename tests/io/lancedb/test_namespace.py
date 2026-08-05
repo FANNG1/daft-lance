@@ -795,9 +795,9 @@ def test_maintenance_udfs_hold_a_context_not_a_dataset(tmp_path: Path) -> None:
 
     from daft_lance.lance_compaction import CompactionTaskUDF
     from daft_lance.lance_merge_column import (
+        AlignedFragmentMergeColumnsUDF,
         FragmentHandler,
         GroupFragmentMergeUDF,
-        NativeReaderFragmentMergeUDF,
     )
     from daft_lance.lance_scalar_index import (
         FragmentIndexHandler,
@@ -815,7 +815,7 @@ def test_maintenance_udfs_hold_a_context_not_a_dataset(tmp_path: Path) -> None:
     wrapped = [
         FragmentHandler(context, {"doubled": "score * 2"}, ["score"]),
         GroupFragmentMergeUDF(context),
-        NativeReaderFragmentMergeUDF(context, ["doubled"]),
+        AlignedFragmentMergeColumnsUDF(context, ["doubled"]),
     ]
 
     instances = plain + [udf._daft_get_instance() for udf in wrapped]

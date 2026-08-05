@@ -247,8 +247,8 @@ class GroupFragmentMergeUDF:
 
 
 @daft_cls
-class NativeReaderFragmentMergeUDF:
-    """Adds positionally aligned columns through Lance's native reader path.
+class AlignedFragmentMergeColumnsUDF:
+    """Adds positionally aligned columns through Lance's reader-based merge API.
 
     Rows that exactly match the fragment's visible ``_rowaddr`` sequence use
     ``LanceFragment.merge_columns(RecordBatchReader)``. Inputs that fail this
@@ -321,9 +321,7 @@ class NativeReaderFragmentMergeUDF:
         )
 
         if not sorted_rowaddrs.equals(expected_rowaddrs):  # type: ignore[arg-type]
-            raise ValueError(
-                f"Native reader fast path requires exact visible _rowaddr alignment for fragment {frag_id}"
-            )
+            raise ValueError(f"Positional merge requires exact visible _rowaddr alignment for fragment {frag_id}")
 
         reader = _pa.RecordBatchReader.from_batches(tbl.schema, tbl.to_batches())
         fragment_meta, schema = fragment.merge_columns(reader)
@@ -331,12 +329,12 @@ class NativeReaderFragmentMergeUDF:
         return [{"fragment_meta": daft.pickle.dumps(fragment_meta), "schema": daft.pickle.dumps(schema)}]
 
 
-def _is_native_reader_candidate(
+def _is_positional_merge_candidate(
     df: daft.DataFrame,
     lance_ds: lance.LanceDataset,
     join_key: str,
 ) -> bool:
-    """Return whether the input warrants per-fragment native-reader validation."""
+    """Return whether the input warrants per-fragment positional validation."""
     if join_key != "_rowaddr":
         return False
     if "_rowaddr" not in df.column_names:
@@ -401,9 +399,9 @@ def merge_columns_from_df(
 
     # Decide whether every row is present so workers may attempt the native
     # positional reader path. Workers still validate exact per-fragment addresses.
-    native_reader_candidate = _is_native_reader_candidate(df, lance_ds, join_key)
+    positional_merge_candidate = _is_positional_merge_candidate(df, lance_ds, join_key)
 
-    if native_reader_candidate:
+    if positional_merge_candidate:
         return _merge_fast_path(
             df,
             lance_ds,
@@ -429,8 +427,8 @@ def _merge_fast_path(
     open_context: DatasetOpenContext,
     new_column_names: list[str],
 ) -> lance.LanceDataset:
-    """Add positionally aligned columns through Lance's native reader API."""
-    handler = NativeReaderFragmentMergeUDF(open_context, new_column_names)
+    """Add positionally aligned columns through Lance's reader-based merge API."""
+    handler = AlignedFragmentMergeColumnsUDF(open_context, new_column_names)
 
     grouped = df.groupby("fragment_id").map_groups(
         handler(*(df[c] for c in new_column_names), df["_rowaddr"], df["fragment_id"]).alias("commit_message")  # type: ignore[attr-defined]
