@@ -43,7 +43,7 @@ def test_fragment_update_handler_reuses_pinned_dataset() -> None:
             return dataset
 
     open_context = OpenContext()
-    handler = _FragmentUpdateHandler(cast(Any, open_context), ["value"], [1])
+    handler = _FragmentUpdateHandler(cast(Any, open_context), ["value"])
 
     assert handler._dataset() is dataset
     assert handler._dataset() is dataset

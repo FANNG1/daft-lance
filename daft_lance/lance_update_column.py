@@ -129,16 +129,11 @@ def _to_arrow_array(series: Any) -> pa.Array[Any]:
 
 def _prepare_fragment_update(columns: list[str], series: tuple[Any, ...]) -> _FragmentUpdateBatch:
     """Validate and convert one Daft fragment group into Arrow inputs."""
-    expected_inputs = len(columns) + 2
-    if len(series) != expected_inputs:
-        raise ValueError(f"Expected {expected_inputs} update inputs, received {len(series)}.")
-
     *update_series, row_address_series, fragment_id_series = series
-    fragment_ids = _to_arrow_array(fragment_id_series)
-    if fragment_ids.null_count:
+    fragment_id_scalar = _to_arrow_array(fragment_id_series)[0]
+    if not fragment_id_scalar.is_valid:
         raise ValueError("fragment_id cannot contain nulls.")
-    fragment_ids = fragment_ids.cast(pa.int64(), safe=True)
-    fragment_id = int(fragment_ids[0].as_py())
+    fragment_id = int(fragment_id_scalar.cast(pa.int64(), safe=True).as_py())
 
     row_addresses = _to_arrow_array(row_address_series)
     if row_addresses.null_count:
@@ -180,7 +175,6 @@ def _rewrite_fragment(
     batch: _FragmentUpdateBatch,
     *,
     columns: list[str],
-    expected_field_ids: list[int],
 ) -> dict[str, Any]:
     """Validate and rewrite one fragment, returning a minimal driver commit message."""
     fragment = lance_ds.get_fragment(batch.fragment_id)
@@ -204,19 +198,13 @@ def _rewrite_fragment(
         raise ValueError(f"Update columns cannot be safely cast to the target Lance schema: {exc}") from exc
 
     update_table = values.append_column(_ROW_ADDRESS, batch.row_addresses)
-    fragment_meta, fields_modified = fragment.update_columns(
+    fragment_meta, _ = fragment.update_columns(
         update_table,
         left_on=_ROW_ADDRESS,
         right_on=_ROW_ADDRESS,
     )
     if int(fragment_meta.id) != batch.fragment_id:
         raise ValueError(f"Fragment rewrite changed fragment id: expected {batch.fragment_id}, got {fragment_meta.id}.")
-
-    observed_field_ids = sorted(fields_modified)
-    if observed_field_ids != expected_field_ids:
-        raise ValueError(
-            f"Modified field ids {observed_field_ids} do not match target column field ids {expected_field_ids}."
-        )
 
     return {
         "fragment_meta": daft.pickle.dumps(fragment_meta),
@@ -230,12 +218,10 @@ class _FragmentUpdateHandler:
     def __init__(
         self,
         open_context: DatasetOpenContext,
-        columns: list[str],
-        expected_field_ids: list[int],
+        update_columns: list[str],
     ) -> None:
         self.open_context = open_context
-        self.columns = columns
-        self.expected_field_ids = expected_field_ids
+        self.update_columns = update_columns
         self._lance_ds: lance.LanceDataset | None = None
 
     def _dataset(self) -> lance.LanceDataset:
@@ -248,13 +234,12 @@ class _FragmentUpdateHandler:
         if not series or len(series[0]) == 0:
             return []
 
-        batch = _prepare_fragment_update(self.columns, series)
+        batch = _prepare_fragment_update(self.update_columns, series)
         return [
             _rewrite_fragment(
                 self._dataset(),
                 batch,
-                columns=self.columns,
-                expected_field_ids=self.expected_field_ids,
+                columns=self.update_columns,
             )
         ]
 
@@ -282,7 +267,7 @@ def update_columns_from_df(
     source = df.select(*resolved_columns, _ROW_ADDRESS, _FRAGMENT_ID)
 
     handler_cls = _fragment_update_handler_cls(max_concurrency)
-    handler = handler_cls(open_context, resolved_columns, expected_field_ids)
+    handler = handler_cls(open_context, resolved_columns)
     grouped = source.groupby(_FRAGMENT_ID).map_groups(
         handler(
             *(source[name] for name in resolved_columns),
