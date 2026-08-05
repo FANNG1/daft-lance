@@ -1,9 +1,9 @@
-"""Extensive tests for the fast-path merge_columns (metadata-only add columns).
+"""Extensive tests for the native-reader fast path used by merge_columns_df.
 
-The fast path writes raw .lance files via LanceFileWriter and stitches them
-into fragment metadata, avoiding full fragment rewrites. If this goes wrong,
-it corrupts the dataset. These tests cover correctness, ordering, integrity,
-type fidelity, auto-detection, incremental merges, and edge cases.
+The fast path passes positionally aligned new columns to
+LanceFragment.merge_columns. These tests cover correctness, ordering,
+deletion vectors, type fidelity, eligibility, incremental merges, and edge
+cases.
 """
 
 from __future__ import annotations
@@ -377,13 +377,11 @@ class TestDataTypes:
         assert ds2.to_table().column("x").to_pylist() == [42, 42]
 
     def test_type_float32(self, ds_path):
-        # NOTE: float32 gets widened to float64 through the pylist round-trip
-        # in the UDF. This is a known limitation of the current fast path.
         ds = create_dataset(ds_path, [{"id": [1, 2]}])
         df = read_with_metadata(ds_path)
         df = df.with_column("x", daft.lit(3.14).cast(daft.DataType.float32()))
         ds2 = merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
-        # Value is preserved even if type widens
+        assert ds2.schema.field("x").type == pa.float32()
         vals = ds2.to_table().column("x").to_pylist()
         assert all(pytest.approx(v, rel=1e-5) == 3.14 for v in vals)
 
@@ -475,6 +473,20 @@ class TestEdgeCases:
         df = df.with_column("x", daft.lit(1))
         ds2 = merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
         assert ds2.version == v_before + 1
+
+    @pytest.mark.parametrize("data_storage_version", ["2.1", "2.2"])
+    def test_native_reader_matches_dataset_storage_version(self, ds_path, data_storage_version):
+        lance.write_dataset(
+            pa.table({"id": [1, 2, 3]}),
+            ds_path,
+            data_storage_version=data_storage_version,
+        )
+        ds = lance.dataset(ds_path)
+        df = read_with_metadata(ds_path).with_column("score", daft.col("id") * 10)
+
+        ds2 = merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
+
+        assert ds2.to_table().sort_by("id").to_pydict()["score"] == [10, 20, 30]
 
 
 # ---------------------------------------------------------------------------
@@ -600,6 +612,105 @@ class TestReadBackIntegrity:
 
 
 class TestRegressions:
+    def test_native_reader_preserves_deletion_vectors(self, ds_path):
+        ds = create_dataset(
+            ds_path,
+            [
+                {"id": [0, 1, 2, 3]},
+                {"id": [4, 5, 6, 7]},
+            ],
+        )
+        ds.delete("id IN (1, 6)")
+        ds = lance.dataset(ds_path)
+        assert all(fragment.metadata.deletion_file is not None for fragment in ds.get_fragments())
+
+        df = read_with_metadata(ds_path).with_column("score", daft.col("id") * 10)
+        assert _can_use_fast_path(df, ds, "_rowaddr") is True
+
+        merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
+        reopened = lance.dataset(ds_path)
+        result = reopened.to_table().sort_by("id").to_pydict()
+
+        assert result["id"] == [0, 2, 3, 4, 5, 7]
+        assert result["score"] == [0, 20, 30, 40, 50, 70]
+        assert all(fragment.metadata.deletion_file is not None for fragment in reopened.get_fragments())
+
+    def test_native_reader_handles_fully_deleted_untouched_fragment(self, ds_path):
+        ds = create_dataset(
+            ds_path,
+            [
+                {"id": [0, 1]},
+                {"id": [2, 3]},
+            ],
+        )
+        ds.delete("id < 2")
+        ds = lance.dataset(ds_path)
+        assert ds.count_rows() == 2
+
+        df = read_with_metadata(ds_path).with_column("score", daft.col("id") * 10)
+        ds2 = merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
+
+        assert ds2.to_table().sort_by("id").to_pydict() == {
+            "id": [2, 3],
+            "score": [20, 30],
+        }
+
+    def test_equal_total_rows_with_fragment_mismatch_uses_keyed_fallback(self, ds_path):
+        ds = create_dataset(
+            ds_path,
+            [
+                {"id": [0, 1]},
+                {"id": [2, 3]},
+            ],
+        )
+        source = read_with_metadata(ds_path).collect().to_pydict()
+        original_fragment_ids = list(source["fragment_id"])
+        fragment_ids = sorted(set(original_fragment_ids))
+        assert len(fragment_ids) == 2
+
+        # Move one row into the wrong fragment group. The total row count still
+        # matches the dataset, so the driver admits this as a candidate; exact
+        # worker-side row-address validation must reject positional assignment.
+        moved_idx = original_fragment_ids.index(fragment_ids[0])
+        mismatched_fragment_ids = list(original_fragment_ids)
+        mismatched_fragment_ids[moved_idx] = fragment_ids[1]
+        df = daft.from_pydict(
+            {
+                "fragment_id": mismatched_fragment_ids,
+                "_rowaddr": source["_rowaddr"],
+                "score": [value * 10 for value in source["id"]],
+            }
+        )
+        assert _can_use_fast_path(df, ds, "_rowaddr") is True
+
+        ds2 = merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
+        result = ds2.to_table().sort_by("id").to_pydict()
+
+        assert result["id"] == [0, 1, 2, 3]
+        assert result["score"][moved_idx] is None
+        assert [value for idx, value in enumerate(result["score"]) if idx != moved_idx] == [10, 20, 30]
+
+    def test_duplicate_rowaddr_uses_keyed_fallback(self, ds_path):
+        ds = create_dataset(ds_path, [{"id": [0, 1, 2]}])
+        source = read_with_metadata(ds_path).collect().to_pydict()
+        rowaddrs = list(source["_rowaddr"])
+        rowaddrs[2] = rowaddrs[1]
+        df = daft.from_pydict(
+            {
+                "fragment_id": source["fragment_id"],
+                "_rowaddr": rowaddrs,
+                "score": [0, 10, 999],
+            }
+        )
+        assert _can_use_fast_path(df, ds, "_rowaddr") is True
+
+        ds2 = merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
+
+        assert ds2.to_table().sort_by("id").to_pydict() == {
+            "id": [0, 1, 2],
+            "score": [0, 999, None],
+        }
+
     def test_fast_path_check_does_not_set_result_cache(self, ds_path):
         """Bug: _can_use_fast_path called df.collect(), which sets df._result_cache.
 
@@ -654,20 +765,8 @@ class TestRegressions:
             for v in emb:
                 assert pytest.approx(float(i), rel=1e-5) == v
 
-    def test_next_fid_uses_manifest_max_field_id(self, ds_path):
-        """Bug: next_fid only scanned top-level lance_schema.fields(), missing child IDs.
-
-        A struct column with M children occupies M+1 Lance field IDs (1 for parent +
-        M for children). With top-level-only scan: max_id = num_top_level_fields - 1,
-        next_fid can collide with a child field ID, and the new file's fragment metadata
-        maps to the wrong schema field → the new column reads back as null.
-
-        Example layout for table with id(0) + meta struct(1, children a=2, b=3):
-          top-level scan       → max=1, next_fid=2 (WRONG: collides with meta.a)
-          ds.max_field_id scan → max=3, next_fid=4 (CORRECT)
-
-        The fix uses Lance's manifest-level max_field_id, which includes child IDs.
-        """
+    def test_native_reader_assigns_field_ids_after_nested_fields(self, ds_path):
+        """Lance assigns new field IDs without colliding with nested child IDs."""
         struct_type = pa.struct([("a", pa.int64()), ("b", pa.utf8())])
         rows = [{"a": i, "b": f"s{i}"} for i in [1, 2, 3]]
         tbl = pa.table(
