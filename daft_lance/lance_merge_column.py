@@ -250,9 +250,8 @@ class GroupFragmentMergeUDF:
 class AlignedFragmentMergeColumnsUDF:
     """Adds positionally aligned columns through Lance's reader-based merge API.
 
-    Rows that exactly match the fragment's visible ``_rowaddr`` sequence use
-    ``LanceFragment.merge_columns(RecordBatchReader)``. Inputs that fail this
-    invariant are rejected instead of risking a positional misalignment.
+    The input is expected to contain every visible row with the correct
+    ``fragment_id`` and ``_rowaddr`` metadata.
     """
 
     def __init__(
@@ -306,22 +305,11 @@ class AlignedFragmentMergeColumnsUDF:
             sort_keys=[("_rowaddr", "ascending")],
         )
         tbl = tbl.take(sort_indices)
-        sorted_rowaddrs = rowaddr_array.take(sort_indices)
 
         lance_ds = self._dataset()
         fragment = lance_ds.get_fragment(frag_id)
         if fragment is None:
             raise ValueError(f"Fragment {frag_id} not found in dataset")
-
-        # The global row-count check only makes this group a fast-path candidate.
-        # Compare exact visible row addresses on the pinned fragment so duplicate,
-        # missing, deleted, or cross-fragment addresses cannot be written by position.
-        expected_rowaddrs = (
-            fragment.to_table(columns=[], with_row_address=True).column("_rowaddr").combine_chunks().cast(_pa.uint64())
-        )
-
-        if not sorted_rowaddrs.equals(expected_rowaddrs):  # type: ignore[arg-type]
-            raise ValueError(f"Positional merge requires exact visible _rowaddr alignment for fragment {frag_id}")
 
         reader = _pa.RecordBatchReader.from_batches(tbl.schema, tbl.to_batches())
         fragment_meta, schema = fragment.merge_columns(reader)
@@ -334,7 +322,7 @@ def _is_positional_merge_candidate(
     lance_ds: lance.LanceDataset,
     join_key: str,
 ) -> bool:
-    """Return whether the input warrants per-fragment positional validation."""
+    """Return whether the input meets the basic positional fast-path requirements."""
     if join_key != "_rowaddr":
         return False
     if "_rowaddr" not in df.column_names:

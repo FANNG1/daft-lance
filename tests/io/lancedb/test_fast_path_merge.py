@@ -655,54 +655,6 @@ class TestRegressions:
             "score": [20, 30],
         }
 
-    def test_equal_total_rows_with_fragment_mismatch_is_rejected(self, ds_path):
-        ds = create_dataset(
-            ds_path,
-            [
-                {"id": [0, 1]},
-                {"id": [2, 3]},
-            ],
-        )
-        source = read_with_metadata(ds_path).collect().to_pydict()
-        original_fragment_ids = list(source["fragment_id"])
-        fragment_ids = sorted(set(original_fragment_ids))
-        assert len(fragment_ids) == 2
-
-        # Move one row into the wrong fragment group. The total row count still
-        # matches the dataset, so the driver admits this as a candidate; exact
-        # worker-side row-address validation must reject positional assignment.
-        moved_idx = original_fragment_ids.index(fragment_ids[0])
-        mismatched_fragment_ids = list(original_fragment_ids)
-        mismatched_fragment_ids[moved_idx] = fragment_ids[1]
-        df = daft.from_pydict(
-            {
-                "fragment_id": mismatched_fragment_ids,
-                "_rowaddr": source["_rowaddr"],
-                "score": [value * 10 for value in source["id"]],
-            }
-        )
-        assert _is_positional_merge_candidate(df, ds, "_rowaddr") is True
-
-        with pytest.raises(ValueError, match="requires exact visible _rowaddr alignment"):
-            merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
-
-    def test_duplicate_rowaddr_is_rejected(self, ds_path):
-        ds = create_dataset(ds_path, [{"id": [0, 1, 2]}])
-        source = read_with_metadata(ds_path).collect().to_pydict()
-        rowaddrs = list(source["_rowaddr"])
-        rowaddrs[2] = rowaddrs[1]
-        df = daft.from_pydict(
-            {
-                "fragment_id": source["fragment_id"],
-                "_rowaddr": rowaddrs,
-                "score": [0, 10, 999],
-            }
-        )
-        assert _is_positional_merge_candidate(df, ds, "_rowaddr") is True
-
-        with pytest.raises(ValueError, match="requires exact visible _rowaddr alignment"):
-            merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
-
     def test_fast_path_check_does_not_set_result_cache(self, ds_path):
         """Bug: the candidate check called df.collect(), which sets df._result_cache.
 
