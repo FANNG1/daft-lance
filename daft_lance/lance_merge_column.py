@@ -251,9 +251,8 @@ class NativeReaderFragmentMergeUDF:
     """Adds positionally aligned columns through Lance's native reader path.
 
     Rows that exactly match the fragment's visible ``_rowaddr`` sequence use
-    ``LanceFragment.merge_columns(RecordBatchReader)``. If the driver-level
-    candidate check was optimistic, the fragment falls back to the keyed merge
-    path instead of risking a positional misalignment.
+    ``LanceFragment.merge_columns(RecordBatchReader)``. Inputs that fail this
+    invariant are rejected instead of risking a positional misalignment.
     """
 
     def __init__(
@@ -321,32 +320,23 @@ class NativeReaderFragmentMergeUDF:
             fragment.to_table(columns=[], with_row_address=True).column("_rowaddr").combine_chunks().cast(_pa.uint64())
         )
 
-        if sorted_rowaddrs.equals(expected_rowaddrs):  # type: ignore[arg-type]
-            reader = _pa.RecordBatchReader.from_batches(tbl.schema, tbl.to_batches())
-            fragment_meta, schema = fragment.merge_columns(reader)
-        else:
-            # Preserve the established slow-path semantics for an optimistic
-            # candidate without re-executing the DataFrame solely for preflight.
-            keyed_tbl = _pa.Table.from_arrays(
-                [sorted_rowaddrs, *(tbl.column(name) for name in self.new_column_names)],
-                names=["_rowaddr", *self.new_column_names],
+        if not sorted_rowaddrs.equals(expected_rowaddrs):  # type: ignore[arg-type]
+            raise ValueError(
+                f"Native reader fast path requires exact visible _rowaddr alignment for fragment {frag_id}"
             )
-            reader = _pa.RecordBatchReader.from_batches(keyed_tbl.schema, keyed_tbl.to_batches())
-            fragment_meta, schema = fragment.merge(
-                reader,
-                left_on="_rowaddr",
-                right_on="_rowaddr",
-                schema=keyed_tbl.schema,
-            )
+
+        reader = _pa.RecordBatchReader.from_batches(tbl.schema, tbl.to_batches())
+        fragment_meta, schema = fragment.merge_columns(reader)
 
         return [{"fragment_meta": daft.pickle.dumps(fragment_meta), "schema": daft.pickle.dumps(schema)}]
 
 
-def _can_use_fast_path(
+def _is_native_reader_candidate(
     df: daft.DataFrame,
     lance_ds: lance.LanceDataset,
     join_key: str,
 ) -> bool:
+    """Return whether the input warrants per-fragment native-reader validation."""
     if join_key != "_rowaddr":
         return False
     if "_rowaddr" not in df.column_names:
@@ -411,9 +401,9 @@ def merge_columns_from_df(
 
     # Decide whether every row is present so workers may attempt the native
     # positional reader path. Workers still validate exact per-fragment addresses.
-    use_fast_path = _can_use_fast_path(df, lance_ds, join_key)
+    native_reader_candidate = _is_native_reader_candidate(df, lance_ds, join_key)
 
-    if use_fast_path:
+    if native_reader_candidate:
         return _merge_fast_path(
             df,
             lance_ds,

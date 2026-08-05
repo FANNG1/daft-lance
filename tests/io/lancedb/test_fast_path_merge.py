@@ -16,7 +16,7 @@ import pyarrow as pa
 import pytest
 
 import daft
-from daft_lance.lance_merge_column import _can_use_fast_path, merge_columns_from_df
+from daft_lance.lance_merge_column import _is_native_reader_candidate, merge_columns_from_df
 from daft_lance.namespace import DatasetOpenContext
 
 # ---------------------------------------------------------------------------
@@ -258,14 +258,14 @@ class TestAutoDetection:
         ds = create_dataset(ds_path, [{"id": [1, 2]}])
         df = read_with_metadata(ds_path)
         df = df.with_column("new", daft.lit(1))
-        assert _can_use_fast_path(df, ds, "_rowaddr") is True
+        assert _is_native_reader_candidate(df, ds, "_rowaddr") is True
 
     def test_falls_back_without_rowaddr(self, ds_path):
         ds = create_dataset(ds_path, [{"id": [1, 2], "val": [10, 20]}])
         # Read WITHOUT _rowaddr — fast path should not be used
         df = daft.read_lance(ds_path, include_fragment_id=True)
         df = df.with_column("doubled", daft.col("val").cast(daft.DataType.int64()) * 2)
-        assert _can_use_fast_path(df, ds, "_rowaddr") is False
+        assert _is_native_reader_candidate(df, ds, "_rowaddr") is False
 
     def test_falls_back_with_business_key(self, ds_path):
         ds = create_dataset(ds_path, [{"id": [1, 2], "val": [10, 20]}])
@@ -275,33 +275,33 @@ class TestAutoDetection:
             default_scan_options={"with_row_address": True},
         )
         df = df.with_column("doubled", daft.col("val").cast(daft.DataType.int64()) * 2)
-        assert _can_use_fast_path(df, ds, "id") is False
+        assert _is_native_reader_candidate(df, ds, "id") is False
 
     def test_falls_back_when_rows_filtered(self, ds_path):
         ds = create_dataset(ds_path, [{"id": [1, 2, 3, 4], "val": [10, 20, 30, 40]}])
         df = read_with_metadata(ds_path)
         df = df.where(daft.col("id") > 2)
         df = df.with_column("new", daft.lit(1))
-        assert _can_use_fast_path(df, ds, "_rowaddr") is False
+        assert _is_native_reader_candidate(df, ds, "_rowaddr") is False
 
     def test_fast_path_flag_is_correct(self, ds_path):
         ds = create_dataset(ds_path, [{"id": [1, 2]}])
         # With _rowaddr + fragment_id + full rows → True
         df_full = read_with_metadata(ds_path).with_column("x", daft.lit(1))
-        assert _can_use_fast_path(df_full, ds, "_rowaddr") is True
+        assert _is_native_reader_candidate(df_full, ds, "_rowaddr") is True
 
         # Without _rowaddr → False
         df_no_addr = daft.read_lance(ds_path, include_fragment_id=True).with_column("x", daft.lit(1))
-        assert _can_use_fast_path(df_no_addr, ds, "_rowaddr") is False
+        assert _is_native_reader_candidate(df_no_addr, ds, "_rowaddr") is False
 
         # Without fragment_id → False
         df_no_frag = daft.read_lance(ds_path, default_scan_options={"with_row_address": True}).with_column(
             "x", daft.lit(1)
         )
-        assert _can_use_fast_path(df_no_frag, ds, "_rowaddr") is False
+        assert _is_native_reader_candidate(df_no_frag, ds, "_rowaddr") is False
 
         # Non-_rowaddr join key → False
-        assert _can_use_fast_path(df_full, ds, "id") is False
+        assert _is_native_reader_candidate(df_full, ds, "id") is False
 
 
 # ---------------------------------------------------------------------------
@@ -625,7 +625,7 @@ class TestRegressions:
         assert all(fragment.metadata.deletion_file is not None for fragment in ds.get_fragments())
 
         df = read_with_metadata(ds_path).with_column("score", daft.col("id") * 10)
-        assert _can_use_fast_path(df, ds, "_rowaddr") is True
+        assert _is_native_reader_candidate(df, ds, "_rowaddr") is True
 
         merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
         reopened = lance.dataset(ds_path)
@@ -655,7 +655,7 @@ class TestRegressions:
             "score": [20, 30],
         }
 
-    def test_equal_total_rows_with_fragment_mismatch_uses_keyed_fallback(self, ds_path):
+    def test_equal_total_rows_with_fragment_mismatch_is_rejected(self, ds_path):
         ds = create_dataset(
             ds_path,
             [
@@ -681,16 +681,12 @@ class TestRegressions:
                 "score": [value * 10 for value in source["id"]],
             }
         )
-        assert _can_use_fast_path(df, ds, "_rowaddr") is True
+        assert _is_native_reader_candidate(df, ds, "_rowaddr") is True
 
-        ds2 = merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
-        result = ds2.to_table().sort_by("id").to_pydict()
+        with pytest.raises(ValueError, match="requires exact visible _rowaddr alignment"):
+            merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
 
-        assert result["id"] == [0, 1, 2, 3]
-        assert result["score"][moved_idx] is None
-        assert [value for idx, value in enumerate(result["score"]) if idx != moved_idx] == [10, 20, 30]
-
-    def test_duplicate_rowaddr_uses_keyed_fallback(self, ds_path):
+    def test_duplicate_rowaddr_is_rejected(self, ds_path):
         ds = create_dataset(ds_path, [{"id": [0, 1, 2]}])
         source = read_with_metadata(ds_path).collect().to_pydict()
         rowaddrs = list(source["_rowaddr"])
@@ -702,17 +698,13 @@ class TestRegressions:
                 "score": [0, 10, 999],
             }
         )
-        assert _can_use_fast_path(df, ds, "_rowaddr") is True
+        assert _is_native_reader_candidate(df, ds, "_rowaddr") is True
 
-        ds2 = merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
-
-        assert ds2.to_table().sort_by("id").to_pydict() == {
-            "id": [0, 1, 2],
-            "score": [0, 999, None],
-        }
+        with pytest.raises(ValueError, match="requires exact visible _rowaddr alignment"):
+            merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
 
     def test_fast_path_check_does_not_set_result_cache(self, ds_path):
-        """Bug: _can_use_fast_path called df.collect(), which sets df._result_cache.
+        """Bug: the candidate check called df.collect(), which sets df._result_cache.
 
         Daft caches collect() results in _result_cache. One-shot Python objects
         in that cache (e.g. BlobFile from take_blobs()) are exhausted; when the
@@ -725,7 +717,7 @@ class TestRegressions:
         df = read_with_metadata(ds_path).with_column("x", daft.lit(1))
 
         assert getattr(df, "_result_cache", None) is None, "cache should start empty"
-        result = _can_use_fast_path(df, ds, "_rowaddr")
+        result = _is_native_reader_candidate(df, ds, "_rowaddr")
         assert result is True
         # count_rows() must not populate _result_cache; collect() would have done so
         assert getattr(df, "_result_cache", None) is None, (
