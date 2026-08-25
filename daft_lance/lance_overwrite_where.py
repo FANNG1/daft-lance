@@ -10,6 +10,7 @@ import pyarrow.compute as pc
 import daft.pickle
 from daft import from_pylist
 from daft.datatype import DataType
+from daft.runners import get_or_create_runner
 from daft.udf import cls as daft_cls
 from daft.udf import method
 
@@ -36,14 +37,19 @@ _SCALAR_INDEX_PLAN_MARKER = "ScalarIndexQuery"
 # A Lance row address packs the fragment id into its high 32 bits.
 _FRAGMENT_ID_SHIFT = pa.scalar(32, type=pa.uint64())
 
+# Each partition builds its own handler and reopens the pinned snapshot once, so
+# this bounds the manifest reads a wide table pays for the extra parallelism.
+_MAX_DELETE_PARTITIONS = 64
 
+
+@daft_cls
 class FragmentDeleteHandler:
     """Applies one delete predicate to a fragment and reports what changed.
 
-    Runs on workers: the driver ships fragment ids, each task reopens the pinned
-    snapshot and writes a deletion file for the rows the predicate matches. Data
-    files are never rewritten, so row addresses -- and every index built on them
-    -- stay valid.
+    Runs as a Daft UDF: the driver ships fragment ids, each task reopens the
+    pinned snapshot and writes a deletion file for the rows the predicate
+    matches. Data files are never rewritten, so row addresses -- and every index
+    built on them -- stay valid.
     """
 
     def __init__(self, open_context: DatasetOpenContext, predicate: str) -> None:
@@ -89,9 +95,9 @@ def _candidate_fragment_ids(dataset: lance.LanceDataset, predicate: str) -> set[
     """Fragment ids that hold rows matching ``predicate``, or None when unknown.
 
     Only worth doing when a scalar index can answer the filter: then this is an
-    index lookup that skips most fragments. Without an index the scan would cost
-    the same full pass the delete step already pays, except serialized on the
-    driver -- so we return None and let every fragment go to the workers.
+    index lookup that skips most fragments. Without an index the scan costs the
+    same full pass the delete step already pays, so we return None and let the
+    delete visit every fragment rather than paying for both.
     """
     scanner = dataset.scanner(columns=[], filter=predicate, with_row_address=True)
     if _SCALAR_INDEX_PLAN_MARKER not in scanner.explain_plan(True):
@@ -110,16 +116,20 @@ def _delete_matching_rows(
     open_context: DatasetOpenContext,
     predicate: str,
     fragment_ids: list[int],
-    concurrency: int | None,
 ) -> tuple[list[FragmentMetadata], list[int]]:
-    """Run the per-fragment delete across the cluster; return (updated, removed)."""
+    """Run the per-fragment delete as a Daft job; return (updated, removed)."""
     if not fragment_ids:
         return [], []
 
     df = from_pylist([{"fragment_id": fragment_id} for fragment_id in fragment_ids])
-    handler_cls = daft_cls(FragmentDeleteHandler, max_concurrency=concurrency)
-    handler = handler_cls(open_context, predicate)
-    df = df.with_column("delete_result", handler(df["fragment_id"]))
+    partitions = min(len(fragment_ids), _MAX_DELETE_PARTITIONS)
+    # from_pylist lands everything in one partition, which would pin the whole
+    # delete to a single task on a distributed runner. The native runner has no
+    # partitions to spread -- repartition there is a no-op that only warns.
+    if partitions > 1 and get_or_create_runner().name != "native":
+        df = df.repartition(partitions, "fragment_id")
+    handler = FragmentDeleteHandler(open_context, predicate)
+    df = df.with_column("delete_result", handler(df["fragment_id"]))  # type: ignore[arg-type]
 
     updated_fragments: list[FragmentMetadata] = []
     removed_fragment_ids: list[int] = []
@@ -136,7 +146,6 @@ def apply_conditional_overwrite(
     open_context: DatasetOpenContext,
     predicate: str,
     new_fragments: list[FragmentMetadata],
-    concurrency: int | None = None,
 ) -> lance.LanceDataset | None:
     """Delete the rows matching ``predicate`` and add ``new_fragments`` in one commit.
 
@@ -156,7 +165,7 @@ def apply_conditional_overwrite(
         fragment_ids = sorted(candidates)
         logger.info("Scalar index pruned delete for %r down to %d fragments", predicate, len(fragment_ids))
 
-    updated_fragments, removed_fragment_ids = _delete_matching_rows(open_context, predicate, fragment_ids, concurrency)
+    updated_fragments, removed_fragment_ids = _delete_matching_rows(open_context, predicate, fragment_ids)
 
     if not updated_fragments and not removed_fragment_ids and not new_fragments:
         return None

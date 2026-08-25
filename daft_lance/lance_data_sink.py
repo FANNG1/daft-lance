@@ -70,6 +70,12 @@ def _dataset_stats(dataset: lance.LanceDataset) -> MicroPartition:
 
 
 def _compile_predicate(predicate: str) -> Expression:
+    """Compile the Lance filter into the Daft expression the input check runs.
+
+    The check deliberately runs a second SQL engine over the input, which is only
+    trustworthy where the two agree; ``_reject_untrusted_predicate`` rules out the
+    case where they do not.
+    """
     try:
         return daft.sql_expr(predicate)
     except Exception as e:
@@ -78,6 +84,28 @@ def _compile_predicate(predicate: str) -> Expression:
             "checked against it. Daft's SQL dialect does not cover every Lance filter; pass "
             "validate_predicate=False to skip the check and write the input as-is."
         ) from e
+
+
+def _evaluates_against(expr: Expression, schema: pa.Schema) -> bool:
+    """Whether ``expr`` resolves and type-checks against a zero-row input."""
+    try:
+        MicroPartition.from_arrow(schema.empty_table()).filter(ExpressionsProjection([expr]))
+    except Exception:
+        return False
+    return True
+
+
+def _predicate_columns(expr: Expression, schema: pa.Schema) -> set[str]:
+    """The columns ``expr`` reads.
+
+    Daft exposes no accessor for an expression's inputs, so this drops one column
+    at a time from a zero-row input and records which removals stop it resolving.
+    """
+    return {
+        field.name
+        for field in schema
+        if not _evaluates_against(expr, pa.schema([f for f in schema if f.name != field.name]))
+    }
 
 
 class LanceDataSink(DataSink[list[FragmentMetadata]]):
@@ -196,11 +224,12 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         self._effective_pyarrow_schema = self._blob.build_effective_schema(self._pyarrow_schema)
 
     def _validate_predicate_against_table(self, dataset: lance.LanceDataset) -> None:
-        """Fail on the driver, before any data is written, if the predicate is bad.
+        """Fail on the driver, before any data is written, if the predicate is unusable.
 
         Planning a scan is enough to surface parse errors and unknown columns;
         without this the write only fails at commit time, after the whole input
-        has been written to storage.
+        has been written to storage. When the input check is on, the predicate
+        must also hold up under Daft, which is checked here for the same reason.
         """
         assert self._predicate is not None
         try:
@@ -209,7 +238,48 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
             raise ValueError(f"predicate={self._predicate!r} is not a valid Lance filter for this table: {e}") from e
 
         if self._validate_predicate:
-            _compile_predicate(self._predicate)
+            self._reject_untrusted_predicate(_compile_predicate(self._predicate), dataset.schema)
+
+    def _reject_untrusted_predicate(self, expr: Expression, table_schema: pa.Schema) -> None:
+        """Refuse to run the input check when Daft would answer differently than Lance.
+
+        Both problems below are silent at write time: the first surfaces as a raw
+        Daft type error from inside a worker, the second as input rows that pass
+        the check and are then never covered by Lance's delete.
+        """
+        # Exactly the schema _prepare_arrow_table casts the input to, so this
+        # sees the types the check will actually evaluate against.
+        target_schema = self._blob.cast_target_schema(table_schema)
+
+        if not _evaluates_against(expr, target_schema):
+            raise ValueError(
+                f"predicate={self._predicate!r} is a valid Lance filter, but Daft cannot evaluate it "
+                "against this table's schema, so the input rows cannot be checked against it (Daft "
+                "reads a bare TIMESTAMP literal as UTC-aware, for example, which will not compare "
+                "against a naive timestamp column). Pass validate_predicate=False to write without "
+                "the check."
+            )
+
+        # Daft widens a narrow float column to f64 before comparing it to a
+        # decimal literal (0.1f32 -> 0.10000000149...), where Lance narrows the
+        # literal to the column's type instead. "score > 0.1" therefore selects
+        # different rows in the two engines, and a row Daft accepts can be one
+        # Lance never deletes -- the duplication this check exists to prevent.
+        narrow_floats = sorted(
+            name
+            for name in _predicate_columns(expr, target_schema)
+            if pa.types.is_float32(target_schema.field(name).type)
+            or pa.types.is_float16(target_schema.field(name).type)
+        )
+        if narrow_floats:
+            raise ValueError(
+                f"predicate={self._predicate!r} reads {', '.join(narrow_floats)}, which Lance stores "
+                "as a narrow float. Daft and Lance compare a decimal literal against such a column "
+                "differently, so a row that passes the input check may not be one Lance deletes, and "
+                "it would survive a re-run of this write. Compare against an exactly representable "
+                "value (0.5, 0.25), or pass validate_predicate=False and make sure the input really "
+                "is inside the predicate."
+            )
 
     @property
     def _namespace_kwargs(self) -> dict[str, Any]:

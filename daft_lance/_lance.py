@@ -661,7 +661,12 @@ def write_lance(
         validate_predicate: For ``mode="overwrite_where"``, check that every input row
             satisfies ``predicate`` and fail the write otherwise (default True). Rows outside
             the predicate are still appended when this is False, which makes re-running the
-            same write duplicate them instead of replacing them.
+            same write duplicate them instead of replacing them. The check evaluates
+            ``predicate`` with Daft, so leaving it on also requires Daft to read the filter the
+            same way Lance does; the write fails up front, before any data is written, when it
+            cannot (a bare ``TIMESTAMP`` literal against a naive timestamp column) or when the
+            two engines disagree (a decimal literal compared against a float32 column). Pass
+            False in those cases.
         table_id: Table identifier within the namespace, e.g. ["catalog", "schema", "table"].
         namespace_impl: Lance Namespace implementation, e.g. "dir" or "rest".
         namespace_properties: Properties for connecting to the namespace, e.g.

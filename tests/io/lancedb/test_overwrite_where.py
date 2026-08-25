@@ -56,12 +56,15 @@ def test_replaces_only_matching_rows_in_one_version(tmp_path: Path) -> None:
 def test_rerunning_the_same_overwrite_is_idempotent(tmp_path: Path) -> None:
     uri = str(tmp_path / "tbl")
     _seed(uri)
+    expected = [("d1", 1), ("d2", 100), ("d2", 101), ("d3", 4)]
 
     _overwrite(uri, ["d2", "d2"], [100, 101], "dt = 'd2'")
-    first = _rows(uri)
+    assert _rows(uri) == expected
+    # The second run has to delete the rows the first one appended, which sit in
+    # a fragment that did not exist when the first run planned its delete.
     _overwrite(uri, ["d2", "d2"], [100, 101], "dt = 'd2'")
 
-    assert _rows(uri) == first
+    assert _rows(uri) == expected
 
 
 def test_predicate_matching_nothing_only_appends(tmp_path: Path) -> None:
@@ -210,6 +213,34 @@ def test_pruning_uses_a_scalar_index_when_one_covers_the_predicate(tmp_path: Pat
     assert _candidate_fragment_ids(dataset, "id = 999") == set()
 
 
+def test_overwrite_through_a_scalar_index_on_the_predicate_column(tmp_path: Path) -> None:
+    """The pruning path, end to end -- a miss here silently leaves rows behind."""
+    uri = str(tmp_path / "tbl")
+    daft_lance.write_lance(
+        daft.from_pydict({"day": [1, 1, 2, 2, 3], "id": [1, 2, 3, 4, 5]}), uri, mode="create", max_rows_per_file=2
+    ).collect()
+    lance.dataset(uri).create_scalar_index("day", "BTREE")
+
+    def rows() -> list[tuple[int, int]]:
+        table = lance.dataset(uri).to_table().to_pydict()
+        return sorted(zip(table["day"], table["id"]))
+
+    def overwrite(new_id: int) -> None:
+        daft_lance.write_lance(
+            daft.from_pydict({"day": [2], "id": [new_id]}), uri, mode="overwrite_where", predicate="day = 2"
+        ).collect()
+
+    assert _candidate_fragment_ids(lance.dataset(uri), "day = 2") is not None, "expected the pruning path"
+    overwrite(100)
+    assert rows() == [(1, 1), (1, 2), (2, 100), (3, 5)]
+
+    # The index does not cover the fragment the first overwrite appended, so this
+    # run only replaces its row if pruning still finds that fragment.
+    assert _candidate_fragment_ids(lance.dataset(uri), "day = 2") is not None, "expected the pruning path"
+    overwrite(200)
+    assert rows() == [(1, 1), (1, 2), (2, 200), (3, 5)]
+
+
 def test_indexed_table_stays_queryable_after_overwrite(tmp_path: Path) -> None:
     uri = str(tmp_path / "tbl")
     n = 300
@@ -247,6 +278,89 @@ def test_indexed_table_stays_queryable_after_overwrite(tmp_path: Path) -> None:
     # New fragments are not in the index; the search must still find them.
     nearest = {"column": "vector", "q": pa.array([8.0, 8.0], type=pa.float32()), "k": 1, "use_index": True}
     assert daft.read_lance(uri, default_scan_options={"nearest": nearest}).select("id").to_pydict()["id"] == [1001]
+
+
+def _float_table(tmp_path: Path) -> str:
+    uri = str(tmp_path / "floats")
+    lance.write_dataset(
+        pa.table(
+            {
+                "score": pa.array([0.1, 0.2], pa.float32()),
+                "dt": pa.array(["d1", "d2"], pa.large_string()),
+                "id": pa.array([1, 2], pa.int64()),
+            }
+        ),
+        uri,
+    )
+    return uri
+
+
+def _float_rows(uri: str, dt: str, id_: int, score: float = 0.1) -> daft.DataFrame:
+    return daft.from_arrow(
+        pa.table(
+            {
+                "score": pa.array([score], pa.float32()),
+                "dt": pa.array([dt], pa.large_string()),
+                "id": pa.array([id_], pa.int64()),
+            }
+        )
+    )
+
+
+def test_narrow_float_predicate_refuses_the_input_check(tmp_path: Path) -> None:
+    """Daft widens float32 before comparing; Lance narrows the literal instead.
+
+    "score > 0.1" is false in Lance for a 0.1f row but true in Daft, so trusting
+    the check would let a row through that the delete never covers -- it would
+    pile up on every re-run.
+    """
+    uri = _float_table(tmp_path)
+
+    with pytest.raises(ValueError, match="narrow float"):
+        daft_lance.write_lance(
+            _float_rows(uri, "d2", 99), uri, mode="overwrite_where", predicate="score > 0.1"
+        ).collect()
+
+    # The opt-out still writes: the caller takes responsibility for the input.
+    daft_lance.write_lance(
+        _float_rows(uri, "d2", 99), uri, mode="overwrite_where", predicate="score > 0.1", validate_predicate=False
+    ).collect()
+    assert sorted(lance.dataset(uri).to_table().to_pydict()["id"]) == [1, 99]
+
+
+def test_float_column_outside_the_predicate_still_validates(tmp_path: Path) -> None:
+    """Only the columns the predicate reads matter, not every float in the table."""
+    uri = _float_table(tmp_path)
+
+    daft_lance.write_lance(
+        _float_rows(uri, "d2", 99, score=0.7), uri, mode="overwrite_where", predicate="dt = 'd2'"
+    ).collect()
+
+    assert sorted(lance.dataset(uri).to_table().to_pydict()["id"]) == [1, 99]
+    with pytest.raises(Exception, match="do not satisfy"):
+        daft_lance.write_lance(
+            _float_rows(uri, "d9", 100), uri, mode="overwrite_where", predicate="dt = 'd2'"
+        ).collect()
+
+
+def test_predicate_daft_cannot_evaluate_fails_before_writing(tmp_path: Path) -> None:
+    """A Lance-valid filter Daft types differently must not fail mid-write."""
+    uri = str(tmp_path / "events")
+    timestamps = pa.array([1787529600000000, 1787616000000000], pa.timestamp("us"))
+    lance.write_dataset(pa.table({"t": timestamps, "id": pa.array([1, 2], pa.int64())}), uri)
+    predicate = "t >= TIMESTAMP '2026-08-25 00:00:00' AND t < TIMESTAMP '2026-08-26 00:00:00'"
+    new_row = daft.from_arrow(
+        pa.table({"t": pa.array([1787529600000000], pa.timestamp("us")), "id": pa.array([50], pa.int64())})
+    )
+
+    with pytest.raises(ValueError, match="validate_predicate=False"):
+        daft_lance.write_lance(new_row, uri, mode="overwrite_where", predicate=predicate).collect()
+    assert sorted(lance.dataset(uri).to_table().to_pydict()["id"]) == [1, 2]
+
+    daft_lance.write_lance(
+        new_row, uri, mode="overwrite_where", predicate=predicate, validate_predicate=False
+    ).collect()
+    assert 50 in lance.dataset(uri).to_table().to_pydict()["id"]
 
 
 def test_namespace_addressed_table(tmp_path: Path) -> None:
@@ -293,4 +407,7 @@ def test_concurrent_append_survives_the_overwrite(tmp_path: Path) -> None:
     results = list(sink.write(iter([MicroPartition.from_pydict({"dt": ["d2"], "id": [100]})])))
     sink.finalize(results)
 
-    assert ("d2", 900) in _rows(uri)
+    # The overwrite replaced every "d2" row it knew about, and the concurrent one
+    # it could not see survived: asserting the whole table keeps this test honest
+    # if the overwrite ever silently turns into a no-op.
+    assert _rows(uri) == [("d1", 1), ("d2", 100), ("d2", 900), ("d3", 4)]
