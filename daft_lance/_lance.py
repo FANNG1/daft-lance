@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pathlib
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 
 from daft import context
 from daft.api_annotations import PublicAPI
@@ -14,7 +14,7 @@ from daft.logical.builder import LogicalPlanBuilder
 from daft.schema import Schema
 
 from .lance_compaction import compact_files_internal
-from .lance_data_sink import LanceDataSink
+from .lance_data_sink import LanceDataSink, LanceWriteMode
 from .lance_merge_column import merge_columns_from_df, merge_columns_internal
 from .lance_scalar_index import create_scalar_index_internal
 from .lance_scan import LanceDBScanOperator
@@ -632,10 +632,12 @@ def compact_files(
 def write_lance(
     df: DataFrame,
     uri: str | pathlib.Path | None = None,
-    mode: Literal["create", "append", "overwrite"] = "create",
+    mode: LanceWriteMode = "create",
     io_config: IOConfig | None = None,
     schema: Schema | pa.Schema | None = None,
     *,
+    predicate: str | None = None,
+    validate_predicate: bool = True,
     table_id: list[str] | None = None,
     namespace_impl: str | None = None,
     namespace_properties: dict[str, str] | None = None,
@@ -646,9 +648,20 @@ def write_lance(
     Args:
         df: The DataFrame to write.
         uri: The URI of the Lance table. Mutually exclusive with the namespace parameters.
-        mode: One of "create", "append", or "overwrite".
+        mode: One of "create", "append", "overwrite", or "overwrite_where".
+            ``"overwrite_where"`` replaces just the rows matching ``predicate``: one Lance
+            commit deletes them from the existing table and adds this DataFrame's data, so
+            readers see either the whole replacement or none of it. It requires an existing
+            table and is not supported with ``use_mem_wal=True``.
         io_config: A custom IOConfig to use when accessing Lance data.
         schema: Desired schema to enforce during write; defaults to the DataFrame schema.
+        predicate: SQL predicate selecting the rows to replace. Required by, and only valid
+            with, ``mode="overwrite_where"``. Uses Lance's SQL filter dialect, e.g.
+            ``"dt = DATE '2026-08-25'"``.
+        validate_predicate: For ``mode="overwrite_where"``, check that every input row
+            satisfies ``predicate`` and fail the write otherwise (default True). Rows outside
+            the predicate are still appended when this is False, which makes re-running the
+            same write duplicate them instead of replacing them.
         table_id: Table identifier within the namespace, e.g. ["catalog", "schema", "table"].
         namespace_impl: Lance Namespace implementation, e.g. "dir" or "rest".
         namespace_properties: Properties for connecting to the namespace, e.g.
@@ -664,11 +677,24 @@ def write_lance(
         plan is constructed. This includes missing/duplicate targets, append
         schema compatibility, and storage-version conflicts.
 
+    Warning:
+        ``mode="overwrite_where"`` commits against the table version the write started
+        from, but Lance does not treat a concurrent append or update as conflicting with
+        it. Rows another writer adds during the overwrite therefore survive it, even when
+        they match ``predicate``, and the commit still succeeds. Make sure no other writer
+        touches the table while a conditional overwrite is running.
+
     Examples:
         >>> import daft, daft_lance
         >>> df = daft.from_pydict({"id": [1, 2]})
         >>> daft_lance.write_lance(
         ...     df, namespace_impl="dir", namespace_properties={"root": "/tmp/tables"}, table_id=["t"]
+        ... ).collect()  # doctest: +SKIP
+
+        Replace one day's rows and add this batch in a single commit:
+
+        >>> daft_lance.write_lance(
+        ...     df, "/tmp/events", mode="overwrite_where", predicate="dt = DATE '2026-08-25'"
         ... ).collect()  # doctest: +SKIP
     """
     validate_uri_or_namespace(uri, namespace_impl, table_id, namespace_properties)
@@ -681,6 +707,8 @@ def write_lance(
         schema,
         mode,
         io_config,
+        predicate=predicate,
+        validate_predicate=validate_predicate,
         table_id=table_id,
         namespace_impl=namespace_impl,
         namespace_properties=namespace_properties,
