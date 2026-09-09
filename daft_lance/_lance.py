@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pathlib
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from daft import context
 from daft.api_annotations import PublicAPI
@@ -14,7 +14,7 @@ from daft.logical.builder import LogicalPlanBuilder
 from daft.schema import Schema
 
 from .lance_compaction import compact_files_internal
-from .lance_data_sink import LanceDataSink, LanceWriteMode
+from .lance_data_sink import LanceDataSink
 from .lance_merge_column import merge_columns_from_df, merge_columns_internal
 from .lance_scalar_index import create_scalar_index_internal
 from .lance_scan import LanceDBScanOperator
@@ -632,7 +632,7 @@ def compact_files(
 def write_lance(
     df: DataFrame,
     uri: str | pathlib.Path | None = None,
-    mode: LanceWriteMode = "create",
+    mode: Literal["create", "append", "overwrite", "insert_overwrite"] = "create",
     io_config: IOConfig | None = None,
     schema: Schema | pa.Schema | None = None,
     *,
@@ -648,17 +648,17 @@ def write_lance(
     Args:
         df: The DataFrame to write.
         uri: The URI of the Lance table. Mutually exclusive with the namespace parameters.
-        mode: One of "create", "append", "overwrite", or "overwrite_where".
-            ``"overwrite_where"`` replaces just the rows matching ``predicate``: one Lance
+        mode: One of "create", "append", "overwrite", or "insert_overwrite".
+            ``"insert_overwrite"`` replaces just the rows matching ``predicate``: one Lance
             commit deletes them from the existing table and adds this DataFrame's data, so
             readers see either the whole replacement or none of it. It requires an existing
             table and is not supported with ``use_mem_wal=True``.
         io_config: A custom IOConfig to use when accessing Lance data.
         schema: Desired schema to enforce during write; defaults to the DataFrame schema.
         predicate: SQL predicate selecting the rows to replace. Required by, and only valid
-            with, ``mode="overwrite_where"``. Uses Lance's SQL filter dialect, e.g.
+            with, ``mode="insert_overwrite"``. Uses Lance's SQL filter dialect, e.g.
             ``"dt = DATE '2026-08-25'"``.
-        validate_predicate: For ``mode="overwrite_where"``, check that every input row
+        validate_predicate: For ``mode="insert_overwrite"``, check that every input row
             satisfies ``predicate`` and fail the write otherwise (default True). Rows outside
             the predicate are still appended when this is False, which makes re-running the
             same write duplicate them instead of replacing them. The check evaluates
@@ -683,7 +683,7 @@ def write_lance(
         schema compatibility, and storage-version conflicts.
 
     Warning:
-        ``mode="overwrite_where"`` commits against the table version the write started
+        ``mode="insert_overwrite"`` commits against the table version the write started
         from, but Lance does not treat a concurrent append or update as conflicting with
         it. Rows another writer adds during the overwrite therefore survive it, even when
         they match ``predicate``, and the commit still succeeds. Make sure no other writer
@@ -699,7 +699,7 @@ def write_lance(
         Replace one day's rows and add this batch in a single commit:
 
         >>> daft_lance.write_lance(
-        ...     df, "/tmp/events", mode="overwrite_where", predicate="dt = DATE '2026-08-25'"
+        ...     df, "/tmp/events", mode="insert_overwrite", predicate="dt = DATE '2026-08-25'"
         ... ).collect()  # doctest: +SKIP
     """
     validate_uri_or_namespace(uri, namespace_impl, table_id, namespace_properties)

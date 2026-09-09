@@ -46,13 +46,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# What the caller asks for, and what the write physically does. ``overwrite_where``
+# What the caller asks for, and what the write physically does. ``insert_overwrite``
 # writes exactly like an append -- it only differs at commit time -- so it is
 # normalized to "append" once in the constructor. Every mode check outside the
 # commit path reads the normalized value, because a check that forgets the new
 # mode fails silently (see resolve_storage_version, which would skip the
 # storage-version compatibility check entirely).
-LanceWriteMode = Literal["create", "append", "overwrite", "overwrite_where"]
 LancePhysicalWriteMode = Literal["create", "append", "overwrite"]
 
 
@@ -115,7 +114,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         self,
         uri: str | pathlib.Path | None,
         schema: Schema | pa.Schema,
-        mode: LanceWriteMode = "create",
+        mode: Literal["create", "append", "overwrite", "insert_overwrite"] = "create",
         io_config: IOConfig | None = None,
         *,
         predicate: str | None = None,
@@ -136,17 +135,17 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
     ) -> None:
         self._reject_unsupported_modes(mode, use_legacy_format)
         self._reject_namespace_mem_wal(namespace_impl, table_id, use_mem_wal)
-        self._validate_overwrite_where(mode, predicate, use_mem_wal)
+        self._validate_insert_overwrite(mode, predicate, use_mem_wal)
         validate_uri_or_namespace(uri, namespace_impl, table_id, namespace_properties)
         if uri is not None and not isinstance(uri, (str, pathlib.Path)):
             raise TypeError(f"Expected URI to be str or pathlib.Path, got {type(uri)}")
 
         self._mode = mode
-        self._is_overwrite_where = mode == "overwrite_where"
-        self._write_mode: LancePhysicalWriteMode = "append" if mode == "overwrite_where" else mode
+        self._is_insert_overwrite = mode == "insert_overwrite"
+        self._write_mode: LancePhysicalWriteMode = "append" if mode == "insert_overwrite" else mode
         self._predicate = predicate.strip() if predicate is not None else None
-        # Only meaningful for overwrite_where; other modes append nothing to filter.
-        self._validate_predicate = validate_predicate and self._is_overwrite_where
+        # Only meaningful for insert_overwrite; other modes append nothing to filter.
+        self._validate_predicate = validate_predicate and self._is_insert_overwrite
         # Compiled lazily on whichever process evaluates it, so no daft Expression
         # ever has to survive the pickling of this sink.
         self._predicate_expr: Expression | None = None
@@ -216,8 +215,8 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         if self._write_mode == "append" and self._table_schema is not None:
             self._blob.add_columns(detect_blob_v2_columns(self._table_schema))
 
-        if self._is_overwrite_where:
-            assert existing is not None, "overwrite_where requires an existing dataset"
+        if self._is_insert_overwrite:
+            assert existing is not None, "insert_overwrite requires an existing dataset"
             self._validate_predicate_against_table(existing)
 
         # Schema actually written to the dataset (blob columns retyped to lance.blob.v2).
@@ -324,7 +323,10 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         return merge_storage_options(io_derived, self._user_storage_options, resolved.storage_options)
 
     @staticmethod
-    def _reject_unsupported_modes(mode: LanceWriteMode, use_legacy_format: bool | None) -> None:
+    def _reject_unsupported_modes(
+        mode: Literal["create", "append", "overwrite", "insert_overwrite"],
+        use_legacy_format: bool | None,
+    ) -> None:
         # This mode was never functional and customers must use merge_columns_df.
         if mode == "merge":  # type: ignore[comparison-overlap]
             raise ValueError(
@@ -343,19 +345,23 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
             )
 
     @staticmethod
-    def _validate_overwrite_where(mode: LanceWriteMode, predicate: str | None, use_mem_wal: bool) -> None:
+    def _validate_insert_overwrite(
+        mode: Literal["create", "append", "overwrite", "insert_overwrite"],
+        predicate: str | None,
+        use_mem_wal: bool,
+    ) -> None:
         """Conditional overwrite needs a predicate, and only works copy-on-write."""
-        if mode != "overwrite_where":
+        if mode != "insert_overwrite":
             if predicate is not None:
-                raise ValueError(f'predicate is only supported with mode="overwrite_where", got mode="{mode}".')
+                raise ValueError(f'predicate is only supported with mode="insert_overwrite", got mode="{mode}".')
             return
         if predicate is None or not predicate.strip():
             raise ValueError(
-                'mode="overwrite_where" requires a non-empty SQL predicate, e.g. predicate="dt = \'2026-08-25\'".'
+                'mode="insert_overwrite" requires a non-empty SQL predicate, e.g. predicate="dt = \'2026-08-25\'".'
             )
         if use_mem_wal:
             raise ValueError(
-                'mode="overwrite_where" is not supported with use_mem_wal=True. The conditional '
+                'mode="insert_overwrite" is not supported with use_mem_wal=True. The conditional '
                 "overwrite commits deletions against a pinned dataset version, which the mem-WAL "
                 "write path does not go through."
             )
@@ -572,7 +578,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
     def _assert_rows_match_predicate(self, table: pa.Table) -> None:
         """Reject input rows the predicate does not select.
 
-        overwrite_where deletes by predicate but appends the input verbatim, so a
+        insert_overwrite deletes by predicate but appends the input verbatim, so a
         row outside the predicate is not covered by the next run of the same
         write: re-running it duplicates that row instead of replacing it.
         """
@@ -584,7 +590,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         if matched != table.num_rows:
             raise ValueError(
                 f"{table.num_rows - matched} of {table.num_rows} input rows do not satisfy "
-                f'predicate={self._predicate!r}. mode="overwrite_where" appends the input as-is, so '
+                f'predicate={self._predicate!r}. mode="insert_overwrite" appends the input as-is, so '
                 "those rows would not be replaced by a re-run of this write. Filter the input, widen "
                 "the predicate, or pass validate_predicate=False to write them anyway."
             )
@@ -610,8 +616,8 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
     def _finalize_cow(self, write_results: list[WriteResult[list[FragmentMetadata]]]) -> MicroPartition:
         fragments = list(chain.from_iterable(write_result.result for write_result in write_results))
 
-        if self._is_overwrite_where:
-            return self._finalize_overwrite_where(fragments)
+        if self._is_insert_overwrite:
+            return self._finalize_insert_overwrite(fragments)
 
         assert self._effective_pyarrow_schema is not None, "LanceDataSink.start() must run before finalize"
         operation: lance.LanceOperation.BaseOperation
@@ -632,9 +638,9 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         )
         return _dataset_stats(dataset)
 
-    def _finalize_overwrite_where(self, fragments: list[FragmentMetadata]) -> MicroPartition:
+    def _finalize_insert_overwrite(self, fragments: list[FragmentMetadata]) -> MicroPartition:
         """Delete the predicate's rows and add this batch's fragments in one commit."""
-        from daft_lance.lance_overwrite_where import apply_conditional_overwrite
+        from daft_lance.lance_insert_overwrite import apply_conditional_overwrite
         from daft_lance.namespace import DatasetOpenContext
 
         assert self._table_uri is not None, "LanceDataSink.start() must run before finalize"
@@ -664,7 +670,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         )
         if dataset is None:
             logger.info(
-                "overwrite_where matched no rows and wrote no data for predicate %r; no version created",
+                "insert_overwrite matched no rows and wrote no data for predicate %r; no version created",
                 self._predicate,
             )
             dataset = lance.dataset(

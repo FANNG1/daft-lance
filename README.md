@@ -49,7 +49,7 @@ import daft_lance
 daft_lance.write_lance(
     df,
     "s3://bucket/events",
-    mode="overwrite_where",
+    mode="insert_overwrite",
     predicate="dt = DATE '2026-08-25'",
 ).collect()
 ```

@@ -1,4 +1,4 @@
-"""Conditional overwrite: ``mode="overwrite_where"`` replaces a predicate's rows in one commit."""
+"""Conditional overwrite: ``mode="insert_overwrite"`` replaces a predicate's rows in one commit."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import daft
 import daft_lance
 from daft.recordbatch import MicroPartition
 from daft_lance.lance_data_sink import LanceDataSink, _compile_predicate
-from daft_lance.lance_overwrite_where import _SCALAR_INDEX_PLAN_MARKER, _candidate_fragment_ids
+from daft_lance.lance_insert_overwrite import _SCALAR_INDEX_PLAN_MARKER, _candidate_fragment_ids
 
 
 def _seed(uri: str) -> None:
@@ -36,7 +36,7 @@ def _rows(uri: str) -> list[tuple[str, int]]:
 
 def _overwrite(uri: str, dts: list[str | None], ids: list[int], predicate: str, **kwargs: Any) -> dict[str, list[Any]]:
     return daft_lance.write_lance(
-        daft.from_pydict({"dt": dts, "id": ids}), uri, mode="overwrite_where", predicate=predicate, **kwargs
+        daft.from_pydict({"dt": dts, "id": ids}), uri, mode="insert_overwrite", predicate=predicate, **kwargs
     ).to_pydict()
 
 
@@ -84,7 +84,7 @@ def test_empty_input_deletes_the_matched_rows(tmp_path: Path) -> None:
     before = lance.dataset(uri).version
     empty = daft.from_pydict({"dt": ["d2"], "id": [1]}).limit(0)
 
-    daft_lance.write_lance(empty, uri, mode="overwrite_where", predicate="dt = 'd2'").collect()
+    daft_lance.write_lance(empty, uri, mode="insert_overwrite", predicate="dt = 'd2'").collect()
 
     assert _rows(uri) == [("d1", 1), ("d3", 4)]
     assert lance.dataset(uri).version == before + 1
@@ -135,10 +135,10 @@ def test_validate_predicate_false_appends_rows_outside_the_predicate(tmp_path: P
 @pytest.mark.parametrize(
     ("kwargs", "match"),
     [
-        ({"mode": "overwrite_where"}, "requires a non-empty SQL predicate"),
-        ({"mode": "overwrite_where", "predicate": "   "}, "requires a non-empty SQL predicate"),
-        ({"mode": "append", "predicate": "dt = 'd2'"}, 'only supported with mode="overwrite_where"'),
-        ({"mode": "overwrite_where", "predicate": "dt = 'd2'", "use_mem_wal": True}, "not supported with use_mem_wal"),
+        ({"mode": "insert_overwrite"}, "requires a non-empty SQL predicate"),
+        ({"mode": "insert_overwrite", "predicate": "   "}, "requires a non-empty SQL predicate"),
+        ({"mode": "append", "predicate": "dt = 'd2'"}, 'only supported with mode="insert_overwrite"'),
+        ({"mode": "insert_overwrite", "predicate": "dt = 'd2'", "use_mem_wal": True}, "not supported with use_mem_wal"),
     ],
 )
 def test_argument_validation(tmp_path: Path, kwargs: dict[str, Any], match: str) -> None:
@@ -147,7 +147,7 @@ def test_argument_validation(tmp_path: Path, kwargs: dict[str, Any], match: str)
 
 
 def test_requires_an_existing_table(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="Cannot overwrite_where to non-existent Lance dataset"):
+    with pytest.raises(ValueError, match="Cannot insert_overwrite to non-existent Lance dataset"):
         _overwrite(str(tmp_path / "missing"), ["d2"], [1], "dt = 'd2'")
 
 
@@ -157,7 +157,7 @@ def test_schema_must_match_like_append(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="Schema of data does not match table schema"):
         daft_lance.write_lance(
-            daft.from_pydict({"dt": ["d2"]}), uri, mode="overwrite_where", predicate="dt = 'd2'"
+            daft.from_pydict({"dt": ["d2"]}), uri, mode="insert_overwrite", predicate="dt = 'd2'"
         ).collect()
 
 
@@ -165,7 +165,7 @@ def test_storage_version_conflict_is_detected_like_append(tmp_path: Path) -> Non
     """Regression guard for the mode normalization.
 
     ``resolve_storage_version`` only checks the "append" mode; before
-    ``overwrite_where`` was normalized to it, a conflicting version was accepted
+    ``insert_overwrite`` was normalized to it, a conflicting version was accepted
     silently.
     """
     uri = str(tmp_path / "tbl")
@@ -227,7 +227,7 @@ def test_overwrite_through_a_scalar_index_on_the_predicate_column(tmp_path: Path
 
     def overwrite(new_id: int) -> None:
         daft_lance.write_lance(
-            daft.from_pydict({"day": [2], "id": [new_id]}), uri, mode="overwrite_where", predicate="day = 2"
+            daft.from_pydict({"day": [2], "id": [new_id]}), uri, mode="insert_overwrite", predicate="day = 2"
         ).collect()
 
     assert _candidate_fragment_ids(lance.dataset(uri), "day = 2") is not None, "expected the pruning path"
@@ -267,7 +267,7 @@ def test_indexed_table_stays_queryable_after_overwrite(tmp_path: Path) -> None:
             "vector": pa.array([[7.0, 7.0], [8.0, 8.0]], type=vector_type),
         }
     )
-    daft_lance.write_lance(daft.from_arrow(new_rows), uri, mode="overwrite_where", predicate="dt = 'd2'").collect()
+    daft_lance.write_lance(daft.from_arrow(new_rows), uri, mode="insert_overwrite", predicate="dt = 'd2'").collect()
 
     dataset = lance.dataset(uri)
     # Deleted rows are invisible through the scalar index that still covers them.
@@ -318,12 +318,12 @@ def test_narrow_float_predicate_refuses_the_input_check(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="narrow float"):
         daft_lance.write_lance(
-            _float_rows(uri, "d2", 99), uri, mode="overwrite_where", predicate="score > 0.1"
+            _float_rows(uri, "d2", 99), uri, mode="insert_overwrite", predicate="score > 0.1"
         ).collect()
 
     # The opt-out still writes: the caller takes responsibility for the input.
     daft_lance.write_lance(
-        _float_rows(uri, "d2", 99), uri, mode="overwrite_where", predicate="score > 0.1", validate_predicate=False
+        _float_rows(uri, "d2", 99), uri, mode="insert_overwrite", predicate="score > 0.1", validate_predicate=False
     ).collect()
     assert sorted(lance.dataset(uri).to_table().to_pydict()["id"]) == [1, 99]
 
@@ -333,13 +333,13 @@ def test_float_column_outside_the_predicate_still_validates(tmp_path: Path) -> N
     uri = _float_table(tmp_path)
 
     daft_lance.write_lance(
-        _float_rows(uri, "d2", 99, score=0.7), uri, mode="overwrite_where", predicate="dt = 'd2'"
+        _float_rows(uri, "d2", 99, score=0.7), uri, mode="insert_overwrite", predicate="dt = 'd2'"
     ).collect()
 
     assert sorted(lance.dataset(uri).to_table().to_pydict()["id"]) == [1, 99]
     with pytest.raises(Exception, match="do not satisfy"):
         daft_lance.write_lance(
-            _float_rows(uri, "d9", 100), uri, mode="overwrite_where", predicate="dt = 'd2'"
+            _float_rows(uri, "d9", 100), uri, mode="insert_overwrite", predicate="dt = 'd2'"
         ).collect()
 
 
@@ -354,11 +354,11 @@ def test_predicate_daft_cannot_evaluate_fails_before_writing(tmp_path: Path) -> 
     )
 
     with pytest.raises(ValueError, match="validate_predicate=False"):
-        daft_lance.write_lance(new_row, uri, mode="overwrite_where", predicate=predicate).collect()
+        daft_lance.write_lance(new_row, uri, mode="insert_overwrite", predicate=predicate).collect()
     assert sorted(lance.dataset(uri).to_table().to_pydict()["id"]) == [1, 2]
 
     daft_lance.write_lance(
-        new_row, uri, mode="overwrite_where", predicate=predicate, validate_predicate=False
+        new_row, uri, mode="insert_overwrite", predicate=predicate, validate_predicate=False
     ).collect()
     assert 50 in lance.dataset(uri).to_table().to_pydict()["id"]
 
@@ -373,7 +373,7 @@ def test_namespace_addressed_table(tmp_path: Path) -> None:
     daft_lance.write_lance(
         daft.from_pydict({"dt": ["d2"], "id": [100]}),
         table_id=table_id,
-        mode="overwrite_where",
+        mode="insert_overwrite",
         predicate="dt = 'd2'",
         **ns,
     ).collect()
@@ -396,7 +396,7 @@ def test_concurrent_append_survives_the_overwrite(tmp_path: Path) -> None:
     sink = LanceDataSink(
         uri=uri,
         schema=daft.from_pydict({"dt": ["d2"], "id": [1]}).schema(),
-        mode="overwrite_where",
+        mode="insert_overwrite",
         predicate="dt = 'd2'",
     )
     sink.start()  # pins the read version
