@@ -50,21 +50,17 @@ daft_lance.write_lance(
     df,
     "s3://bucket/events",
     mode="insert_overwrite",
-    predicate="dt = DATE '2026-08-25'",
+    overwrite_where="dt = DATE '2026-08-25'",
 ).collect()
 ```
 
-The table must already exist, and every input row must satisfy `predicate` — pass
-`validate_predicate=False` to append rows outside it anyway (which makes re-running the same
-write duplicate them instead of replacing them). That check evaluates the predicate with Daft,
-so with it on the filter has to mean the same thing to both engines; a predicate Daft types
-differently (a bare `TIMESTAMP` literal against a naive timestamp column) or evaluates
-differently (a decimal literal against a `float32` column) is rejected up front, before any
-data is written, and needs `validate_predicate=False`.
+The table must already exist. `overwrite_where` determines which existing rows are removed;
+the input DataFrame is appended as-is. Rows outside `overwrite_where` are not replaced by a
+later re-run, so callers should filter the input first when they need idempotent replacement.
 
 > **Warning:** Lance does not treat a concurrent append or update as conflicting with this
 > commit, so rows another writer adds while the overwrite runs survive it even when they match
-> `predicate`, without any error. Make sure no other writer touches the table during a
+> `overwrite_where`, without any error. Make sure no other writer touches the table during a
 > conditional overwrite.
 
 ### Namespace Tables

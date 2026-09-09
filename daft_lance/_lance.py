@@ -636,8 +636,7 @@ def write_lance(
     io_config: IOConfig | None = None,
     schema: Schema | pa.Schema | None = None,
     *,
-    predicate: str | None = None,
-    validate_predicate: bool = True,
+    overwrite_where: str | None = None,
     table_id: list[str] | None = None,
     namespace_impl: str | None = None,
     namespace_properties: dict[str, str] | None = None,
@@ -649,24 +648,15 @@ def write_lance(
         df: The DataFrame to write.
         uri: The URI of the Lance table. Mutually exclusive with the namespace parameters.
         mode: One of "create", "append", "overwrite", or "insert_overwrite".
-            ``"insert_overwrite"`` replaces just the rows matching ``predicate``: one Lance
+            ``"insert_overwrite"`` replaces just the rows matching ``overwrite_where``: one Lance
             commit deletes them from the existing table and adds this DataFrame's data, so
             readers see either the whole replacement or none of it. It requires an existing
             table and is not supported with ``use_mem_wal=True``.
         io_config: A custom IOConfig to use when accessing Lance data.
         schema: Desired schema to enforce during write; defaults to the DataFrame schema.
-        predicate: SQL predicate selecting the rows to replace. Required by, and only valid
+        overwrite_where: SQL predicate selecting the rows to replace. Required by, and only valid
             with, ``mode="insert_overwrite"``. Uses Lance's SQL filter dialect, e.g.
             ``"dt = DATE '2026-08-25'"``.
-        validate_predicate: For ``mode="insert_overwrite"``, check that every input row
-            satisfies ``predicate`` and fail the write otherwise (default True). Rows outside
-            the predicate are still appended when this is False, which makes re-running the
-            same write duplicate them instead of replacing them. The check evaluates
-            ``predicate`` with Daft, so leaving it on also requires Daft to read the filter the
-            same way Lance does; the write fails up front, before any data is written, when it
-            cannot (a bare ``TIMESTAMP`` literal against a naive timestamp column) or when the
-            two engines disagree (a decimal literal compared against a float32 column). Pass
-            False in those cases.
         table_id: Table identifier within the namespace, e.g. ["catalog", "schema", "table"].
         namespace_impl: Lance Namespace implementation, e.g. "dir" or "rest".
         namespace_properties: Properties for connecting to the namespace, e.g.
@@ -686,7 +676,7 @@ def write_lance(
         ``mode="insert_overwrite"`` commits against the table version the write started
         from, but Lance does not treat a concurrent append or update as conflicting with
         it. Rows another writer adds during the overwrite therefore survive it, even when
-        they match ``predicate``, and the commit still succeeds. Make sure no other writer
+        they match ``overwrite_where``, and the commit still succeeds. Make sure no other writer
         touches the table while a conditional overwrite is running.
 
     Examples:
@@ -699,7 +689,7 @@ def write_lance(
         Replace one day's rows and add this batch in a single commit:
 
         >>> daft_lance.write_lance(
-        ...     df, "/tmp/events", mode="insert_overwrite", predicate="dt = DATE '2026-08-25'"
+        ...     df, "/tmp/events", mode="insert_overwrite", overwrite_where="dt = DATE '2026-08-25'"
         ... ).collect()  # doctest: +SKIP
     """
     validate_uri_or_namespace(uri, namespace_impl, table_id, namespace_properties)
@@ -712,8 +702,7 @@ def write_lance(
         schema,
         mode,
         io_config,
-        predicate=predicate,
-        validate_predicate=validate_predicate,
+        overwrite_where=overwrite_where,
         table_id=table_id,
         namespace_impl=namespace_impl,
         namespace_properties=namespace_properties,
