@@ -141,7 +141,7 @@ def _delete_matching_rows(
     return updated_fragments, removed_fragment_ids
 
 
-def apply_conditional_overwrite(
+def apply_insert_overwrite(
     *,
     open_context: DatasetOpenContext,
     predicate: str,

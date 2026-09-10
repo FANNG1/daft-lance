@@ -672,13 +672,6 @@ def write_lance(
         plan is constructed. This includes missing/duplicate targets, append
         schema compatibility, and storage-version conflicts.
 
-    Warning:
-        ``mode="insert_overwrite"`` commits against the table version the write started
-        from, but Lance does not treat a concurrent append or update as conflicting with
-        it. Rows another writer adds during the overwrite therefore survive it, even when
-        they match ``overwrite_where``, and the commit still succeeds. Make sure no other writer
-        touches the table while a conditional overwrite is running.
-
     Examples:
         >>> import daft, daft_lance
         >>> df = daft.from_pydict({"id": [1, 2]})

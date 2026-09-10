@@ -522,7 +522,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
 
     def _finalize_insert_overwrite(self, fragments: list[FragmentMetadata]) -> MicroPartition:
         """Delete the predicate's rows and add this batch's fragments in one commit."""
-        from daft_lance.lance_insert_overwrite import apply_conditional_overwrite
+        from daft_lance.lance_insert_overwrite import apply_insert_overwrite
         from daft_lance.namespace import DatasetOpenContext
 
         assert self._table_uri is not None, "LanceDataSink.start() must run before finalize"
@@ -545,7 +545,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
             table_id=self._table_id,
             managed_versioning=self._managed_versioning,
         )
-        dataset = apply_conditional_overwrite(
+        dataset = apply_insert_overwrite(
             open_context=open_context,
             predicate=self._overwrite_where,
             new_fragments=fragments,
