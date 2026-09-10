@@ -1,12 +1,8 @@
 from __future__ import annotations
 
-import json
-import os
-import uuid
 from typing import TYPE_CHECKING, Any
 
 import lance
-from lance.schema import LanceSchema
 
 import daft.pickle
 from daft import from_pylist
@@ -251,12 +247,11 @@ class GroupFragmentMergeUDF:
 
 
 @daft_cls
-class FastPathFragmentWriter:
-    """Writes new columns as raw .lance files and stitches them into fragment metadata.
+class AlignedFragmentMergeColumnsUDF:
+    """Adds positionally aligned columns through Lance's reader-based merge API.
 
-    This avoids rewriting existing data — only the new column values are written.
-    Requires rows to be positionally aligned with the fragment (sorted by _rowaddr,
-    complete row count).
+    The input is expected to contain every visible row with the correct
+    ``fragment_id`` and ``_rowaddr`` metadata.
     """
 
     def __init__(
@@ -275,9 +270,6 @@ class FastPathFragmentWriter:
 
     @method.batch(return_dtype=_FRAGMENT_HANDLER_RETURN_DTYPE)
     def __call__(self, *cols: Any) -> list[dict[str, bytes]]:
-        from lance.file import LanceFileWriter
-        from lance.fragment import FragmentMetadata
-
         from daft.dependencies import pa as _pa
 
         if len(cols) == 0:
@@ -291,7 +283,7 @@ class FastPathFragmentWriter:
 
         rowaddrs = rowaddr_col.to_pylist() if hasattr(rowaddr_col, "to_pylist") else list(rowaddr_col)
 
-        # Build table of new columns, preserving the Arrow type from the daft Series.
+        # Build a table of new columns, preserving the Arrow type from the Daft Series.
         # pa.array(s.to_pylist()) loses type information: fixed_size_list<float32>[N]
         # becomes list<double> because Python floats are float64 and list structure is
         # inferred from Python lists. Using s.to_arrow() avoids this type erasure.
@@ -307,70 +299,30 @@ class FastPathFragmentWriter:
         tbl = _pa.table({name: arr for name, arr in zip(self.new_column_names, arrays)})
 
         # Sort by _rowaddr to restore positional order
+        rowaddr_array = _pa.array(rowaddrs, type=_pa.uint64())
         sort_indices = _pa.compute.sort_indices(
-            _pa.table({"_rowaddr": _pa.array(rowaddrs, type=_pa.uint64())}),
+            _pa.table({"_rowaddr": rowaddr_array}),
             sort_keys=[("_rowaddr", "ascending")],
         )
         tbl = tbl.take(sort_indices)
 
-        # Determine the existing file format version so the new file matches.
-        # Lance commit rejects fragments whose files mix major/minor versions.
         lance_ds = self._dataset()
         fragment = lance_ds.get_fragment(frag_id)
         if fragment is None:
             raise ValueError(f"Fragment {frag_id} not found in dataset")
-        meta = dict(fragment.metadata.to_json())
-        existing_files = list(meta["files"])
-        if not existing_files:
-            raise ValueError(f"Fragment {frag_id} has no data files; cannot infer version for fast-path write")
-        file_major = int(existing_files[0]["file_major_version"])
-        file_minor = int(existing_files[0]["file_minor_version"])
 
-        # Write raw .lance file with only new columns
-        filename = uuid.uuid4().hex + ".lance"
-        filepath = os.path.join(self.open_context.uri, "data", filename)
-        with LanceFileWriter(
-            filepath,
-            tbl.schema,
-            version=f"{file_major}.{file_minor}",
-            storage_options=self.open_context.storage_options,
-        ) as writer:
-            for b in tbl.to_batches():
-                writer.write_batch(b)
-        file_size = os.path.getsize(filepath)
+        reader = _pa.RecordBatchReader.from_batches(tbl.schema, tbl.to_batches())
+        fragment_meta, schema = fragment.merge_columns(reader)
 
-        # Determine field IDs for the new columns. Lance's manifest-level
-        # max_field_id includes nested child fields and field IDs from dropped
-        # columns, so it is the correct high-water mark for dataset evolution.
-        next_fid = lance_ds.max_field_id + 1
-
-        # Stitch new data file into fragment metadata
-        new_file_entry = {
-            "path": filename,
-            "fields": list(range(next_fid, next_fid + len(self.new_column_names))),
-            "column_indices": list(range(len(self.new_column_names))),
-            "file_major_version": file_major,
-            "file_minor_version": file_minor,
-            "file_size_bytes": file_size,
-            "base_id": None,
-        }
-        meta["files"] = list(meta["files"]) + [new_file_entry]
-        new_frag_meta = FragmentMetadata.from_json(json.dumps(meta))
-
-        # Build new schema (original + new columns)
-        new_schema = lance_ds.schema
-        for col_name in self.new_column_names:
-            col_idx = tbl.schema.get_field_index(col_name)
-            new_schema = new_schema.append(_pa.field(col_name, tbl.schema.field(col_idx).type))
-
-        return [{"fragment_meta": daft.pickle.dumps(new_frag_meta), "schema": daft.pickle.dumps(new_schema)}]
+        return [{"fragment_meta": daft.pickle.dumps(fragment_meta), "schema": daft.pickle.dumps(schema)}]
 
 
-def _can_use_fast_path(
+def _is_positional_merge_candidate(
     df: daft.DataFrame,
     lance_ds: lance.LanceDataset,
     join_key: str,
 ) -> bool:
+    """Return whether the input meets the basic positional fast-path requirements."""
     if join_key != "_rowaddr":
         return False
     if "_rowaddr" not in df.column_names:
@@ -433,10 +385,11 @@ def merge_columns_from_df(
     if read_columns is None:
         read_columns = [join_key] + new_cols
 
-    # Decide: fast path (raw file write) or slow path (keyed join)
-    use_fast_path = _can_use_fast_path(df, lance_ds, join_key)
+    # Decide whether every row is present so workers may attempt the native
+    # positional reader path. Workers still validate exact per-fragment addresses.
+    positional_merge_candidate = _is_positional_merge_candidate(df, lance_ds, join_key)
 
-    if use_fast_path:
+    if positional_merge_candidate:
         return _merge_fast_path(
             df,
             lance_ds,
@@ -462,8 +415,8 @@ def _merge_fast_path(
     open_context: DatasetOpenContext,
     new_column_names: list[str],
 ) -> lance.LanceDataset:
-    """Metadata-only add_columns: write raw .lance files and stitch into fragment metadata."""
-    handler = FastPathFragmentWriter(open_context, new_column_names)
+    """Add positionally aligned columns through Lance's reader-based merge API."""
+    handler = AlignedFragmentMergeColumnsUDF(open_context, new_column_names)
 
     grouped = df.groupby("fragment_id").map_groups(
         handler(*(df[c] for c in new_column_names), df["_rowaddr"], df["fragment_id"]).alias("commit_message")  # type: ignore[attr-defined]
@@ -488,7 +441,7 @@ def _merge_fast_path(
 
     _include_untouched_fragments(fragment_metas, lance_ds)
 
-    op = lance.LanceOperation.Merge(fragment_metas, LanceSchema.from_pyarrow(new_schema))
+    op = lance.LanceOperation.Merge(fragment_metas, new_schema)
     return lance.LanceDataset.commit(
         open_context.uri,
         op,

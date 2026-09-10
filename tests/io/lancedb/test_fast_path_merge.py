@@ -1,9 +1,9 @@
-"""Extensive tests for the fast-path merge_columns (metadata-only add columns).
+"""Extensive tests for the positional fast path used by merge_columns_df.
 
-The fast path writes raw .lance files via LanceFileWriter and stitches them
-into fragment metadata, avoiding full fragment rewrites. If this goes wrong,
-it corrupts the dataset. These tests cover correctness, ordering, integrity,
-type fidelity, auto-detection, incremental merges, and edge cases.
+The fast path passes positionally aligned new columns to
+LanceFragment.merge_columns. These tests cover correctness, ordering,
+deletion vectors, type fidelity, eligibility, incremental merges, and edge
+cases.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import pyarrow as pa
 import pytest
 
 import daft
-from daft_lance.lance_merge_column import _can_use_fast_path, merge_columns_from_df
+from daft_lance.lance_merge_column import _is_positional_merge_candidate, merge_columns_from_df
 from daft_lance.namespace import DatasetOpenContext
 
 # ---------------------------------------------------------------------------
@@ -258,14 +258,14 @@ class TestAutoDetection:
         ds = create_dataset(ds_path, [{"id": [1, 2]}])
         df = read_with_metadata(ds_path)
         df = df.with_column("new", daft.lit(1))
-        assert _can_use_fast_path(df, ds, "_rowaddr") is True
+        assert _is_positional_merge_candidate(df, ds, "_rowaddr") is True
 
     def test_falls_back_without_rowaddr(self, ds_path):
         ds = create_dataset(ds_path, [{"id": [1, 2], "val": [10, 20]}])
         # Read WITHOUT _rowaddr — fast path should not be used
         df = daft.read_lance(ds_path, include_fragment_id=True)
         df = df.with_column("doubled", daft.col("val").cast(daft.DataType.int64()) * 2)
-        assert _can_use_fast_path(df, ds, "_rowaddr") is False
+        assert _is_positional_merge_candidate(df, ds, "_rowaddr") is False
 
     def test_falls_back_with_business_key(self, ds_path):
         ds = create_dataset(ds_path, [{"id": [1, 2], "val": [10, 20]}])
@@ -275,33 +275,33 @@ class TestAutoDetection:
             default_scan_options={"with_row_address": True},
         )
         df = df.with_column("doubled", daft.col("val").cast(daft.DataType.int64()) * 2)
-        assert _can_use_fast_path(df, ds, "id") is False
+        assert _is_positional_merge_candidate(df, ds, "id") is False
 
     def test_falls_back_when_rows_filtered(self, ds_path):
         ds = create_dataset(ds_path, [{"id": [1, 2, 3, 4], "val": [10, 20, 30, 40]}])
         df = read_with_metadata(ds_path)
         df = df.where(daft.col("id") > 2)
         df = df.with_column("new", daft.lit(1))
-        assert _can_use_fast_path(df, ds, "_rowaddr") is False
+        assert _is_positional_merge_candidate(df, ds, "_rowaddr") is False
 
     def test_fast_path_flag_is_correct(self, ds_path):
         ds = create_dataset(ds_path, [{"id": [1, 2]}])
         # With _rowaddr + fragment_id + full rows → True
         df_full = read_with_metadata(ds_path).with_column("x", daft.lit(1))
-        assert _can_use_fast_path(df_full, ds, "_rowaddr") is True
+        assert _is_positional_merge_candidate(df_full, ds, "_rowaddr") is True
 
         # Without _rowaddr → False
         df_no_addr = daft.read_lance(ds_path, include_fragment_id=True).with_column("x", daft.lit(1))
-        assert _can_use_fast_path(df_no_addr, ds, "_rowaddr") is False
+        assert _is_positional_merge_candidate(df_no_addr, ds, "_rowaddr") is False
 
         # Without fragment_id → False
         df_no_frag = daft.read_lance(ds_path, default_scan_options={"with_row_address": True}).with_column(
             "x", daft.lit(1)
         )
-        assert _can_use_fast_path(df_no_frag, ds, "_rowaddr") is False
+        assert _is_positional_merge_candidate(df_no_frag, ds, "_rowaddr") is False
 
         # Non-_rowaddr join key → False
-        assert _can_use_fast_path(df_full, ds, "id") is False
+        assert _is_positional_merge_candidate(df_full, ds, "id") is False
 
 
 # ---------------------------------------------------------------------------
@@ -377,13 +377,11 @@ class TestDataTypes:
         assert ds2.to_table().column("x").to_pylist() == [42, 42]
 
     def test_type_float32(self, ds_path):
-        # NOTE: float32 gets widened to float64 through the pylist round-trip
-        # in the UDF. This is a known limitation of the current fast path.
         ds = create_dataset(ds_path, [{"id": [1, 2]}])
         df = read_with_metadata(ds_path)
         df = df.with_column("x", daft.lit(3.14).cast(daft.DataType.float32()))
         ds2 = merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
-        # Value is preserved even if type widens
+        assert ds2.schema.field("x").type == pa.float32()
         vals = ds2.to_table().column("x").to_pylist()
         assert all(pytest.approx(v, rel=1e-5) == 3.14 for v in vals)
 
@@ -475,6 +473,20 @@ class TestEdgeCases:
         df = df.with_column("x", daft.lit(1))
         ds2 = merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
         assert ds2.version == v_before + 1
+
+    @pytest.mark.parametrize("data_storage_version", ["2.1", "2.2"])
+    def test_aligned_merge_matches_dataset_storage_version(self, ds_path, data_storage_version):
+        lance.write_dataset(
+            pa.table({"id": [1, 2, 3]}),
+            ds_path,
+            data_storage_version=data_storage_version,
+        )
+        ds = lance.dataset(ds_path)
+        df = read_with_metadata(ds_path).with_column("score", daft.col("id") * 10)
+
+        ds2 = merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
+
+        assert ds2.to_table().sort_by("id").to_pydict()["score"] == [10, 20, 30]
 
 
 # ---------------------------------------------------------------------------
@@ -600,8 +612,51 @@ class TestReadBackIntegrity:
 
 
 class TestRegressions:
+    def test_aligned_merge_preserves_deletion_vectors(self, ds_path):
+        ds = create_dataset(
+            ds_path,
+            [
+                {"id": [0, 1, 2, 3]},
+                {"id": [4, 5, 6, 7]},
+            ],
+        )
+        ds.delete("id IN (1, 6)")
+        ds = lance.dataset(ds_path)
+        assert all(fragment.metadata.deletion_file is not None for fragment in ds.get_fragments())
+
+        df = read_with_metadata(ds_path).with_column("score", daft.col("id") * 10)
+        assert _is_positional_merge_candidate(df, ds, "_rowaddr") is True
+
+        merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
+        reopened = lance.dataset(ds_path)
+        result = reopened.to_table().sort_by("id").to_pydict()
+
+        assert result["id"] == [0, 2, 3, 4, 5, 7]
+        assert result["score"] == [0, 20, 30, 40, 50, 70]
+        assert all(fragment.metadata.deletion_file is not None for fragment in reopened.get_fragments())
+
+    def test_aligned_merge_handles_fully_deleted_untouched_fragment(self, ds_path):
+        ds = create_dataset(
+            ds_path,
+            [
+                {"id": [0, 1]},
+                {"id": [2, 3]},
+            ],
+        )
+        ds.delete("id < 2")
+        ds = lance.dataset(ds_path)
+        assert ds.count_rows() == 2
+
+        df = read_with_metadata(ds_path).with_column("score", daft.col("id") * 10)
+        ds2 = merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
+
+        assert ds2.to_table().sort_by("id").to_pydict() == {
+            "id": [2, 3],
+            "score": [20, 30],
+        }
+
     def test_fast_path_check_does_not_set_result_cache(self, ds_path):
-        """Bug: _can_use_fast_path called df.collect(), which sets df._result_cache.
+        """Bug: the candidate check called df.collect(), which sets df._result_cache.
 
         Daft caches collect() results in _result_cache. One-shot Python objects
         in that cache (e.g. BlobFile from take_blobs()) are exhausted; when the
@@ -614,7 +669,7 @@ class TestRegressions:
         df = read_with_metadata(ds_path).with_column("x", daft.lit(1))
 
         assert getattr(df, "_result_cache", None) is None, "cache should start empty"
-        result = _can_use_fast_path(df, ds, "_rowaddr")
+        result = _is_positional_merge_candidate(df, ds, "_rowaddr")
         assert result is True
         # count_rows() must not populate _result_cache; collect() would have done so
         assert getattr(df, "_result_cache", None) is None, (
@@ -654,20 +709,8 @@ class TestRegressions:
             for v in emb:
                 assert pytest.approx(float(i), rel=1e-5) == v
 
-    def test_next_fid_uses_manifest_max_field_id(self, ds_path):
-        """Bug: next_fid only scanned top-level lance_schema.fields(), missing child IDs.
-
-        A struct column with M children occupies M+1 Lance field IDs (1 for parent +
-        M for children). With top-level-only scan: max_id = num_top_level_fields - 1,
-        next_fid can collide with a child field ID, and the new file's fragment metadata
-        maps to the wrong schema field → the new column reads back as null.
-
-        Example layout for table with id(0) + meta struct(1, children a=2, b=3):
-          top-level scan       → max=1, next_fid=2 (WRONG: collides with meta.a)
-          ds.max_field_id scan → max=3, next_fid=4 (CORRECT)
-
-        The fix uses Lance's manifest-level max_field_id, which includes child IDs.
-        """
+    def test_reader_merge_assigns_field_ids_after_nested_fields(self, ds_path):
+        """Lance assigns new field IDs without colliding with nested child IDs."""
         struct_type = pa.struct([("a", pa.int64()), ("b", pa.utf8())])
         rows = [{"a": i, "b": f"s{i}"} for i in [1, 2, 3]]
         tbl = pa.table(
