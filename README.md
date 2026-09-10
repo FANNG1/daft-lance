@@ -38,6 +38,31 @@ from daft_lance import merge_columns_df
 merge_columns_df(df, "s3://bucket/my_dataset")
 ```
 
+### Conditional Overwrite
+
+Replace just the rows matching a predicate. One Lance commit deletes them from the existing
+table and adds the new data, so readers see either the whole replacement or none of it.
+
+```python
+import daft_lance
+
+daft_lance.write_lance(
+    df,
+    "s3://bucket/events",
+    mode="insert_overwrite",
+    overwrite_where="dt = DATE '2026-08-25'",
+).collect()
+```
+
+The table must already exist. `overwrite_where` determines which existing rows are removed;
+the input DataFrame is appended as-is. Rows outside `overwrite_where` are not replaced by a
+later re-run, so callers should filter the input first when they need idempotent replacement.
+
+> **Warning:** Lance does not treat a concurrent append or update as conflicting with this
+> commit, so rows another writer adds while the overwrite runs survive it even when they match
+> `overwrite_where`, without any error. Make sure no other writer touches the table during a
+> conditional overwrite.
+
 ### Namespace Tables
 
 Address Lance tables through a [Lance Namespace](https://lancedb.github.io/lance-namespace/)

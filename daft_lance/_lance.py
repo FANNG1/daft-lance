@@ -632,10 +632,11 @@ def compact_files(
 def write_lance(
     df: DataFrame,
     uri: str | pathlib.Path | None = None,
-    mode: Literal["create", "append", "overwrite"] = "create",
+    mode: Literal["create", "append", "overwrite", "insert_overwrite"] = "create",
     io_config: IOConfig | None = None,
     schema: Schema | pa.Schema | None = None,
     *,
+    overwrite_where: str | None = None,
     table_id: list[str] | None = None,
     namespace_impl: str | None = None,
     namespace_properties: dict[str, str] | None = None,
@@ -646,9 +647,16 @@ def write_lance(
     Args:
         df: The DataFrame to write.
         uri: The URI of the Lance table. Mutually exclusive with the namespace parameters.
-        mode: One of "create", "append", or "overwrite".
+        mode: One of "create", "append", "overwrite", or "insert_overwrite".
+            ``"insert_overwrite"`` replaces just the rows matching ``overwrite_where``: one Lance
+            commit deletes them from the existing table and adds this DataFrame's data, so
+            readers see either the whole replacement or none of it. It requires an existing
+            table and is not supported with ``use_mem_wal=True``.
         io_config: A custom IOConfig to use when accessing Lance data.
         schema: Desired schema to enforce during write; defaults to the DataFrame schema.
+        overwrite_where: SQL predicate selecting the rows to replace. Required by, and only valid
+            with, ``mode="insert_overwrite"``. Uses Lance's SQL filter dialect, e.g.
+            ``"dt = DATE '2026-08-25'"``.
         table_id: Table identifier within the namespace, e.g. ["catalog", "schema", "table"].
         namespace_impl: Lance Namespace implementation, e.g. "dir" or "rest".
         namespace_properties: Properties for connecting to the namespace, e.g.
@@ -670,6 +678,12 @@ def write_lance(
         >>> daft_lance.write_lance(
         ...     df, namespace_impl="dir", namespace_properties={"root": "/tmp/tables"}, table_id=["t"]
         ... ).collect()  # doctest: +SKIP
+
+        Replace one day's rows and add this batch in a single commit:
+
+        >>> daft_lance.write_lance(
+        ...     df, "/tmp/events", mode="insert_overwrite", overwrite_where="dt = DATE '2026-08-25'"
+        ... ).collect()  # doctest: +SKIP
     """
     validate_uri_or_namespace(uri, namespace_impl, table_id, namespace_properties)
 
@@ -681,6 +695,7 @@ def write_lance(
         schema,
         mode,
         io_config,
+        overwrite_where=overwrite_where,
         table_id=table_id,
         namespace_impl=namespace_impl,
         namespace_properties=namespace_properties,
