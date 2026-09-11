@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from functools import cache
 from typing import TYPE_CHECKING, Any, cast
 
 import lance
@@ -244,12 +243,6 @@ class _FragmentUpdateHandler:
         ]
 
 
-@cache
-def _fragment_update_handler_cls(max_concurrency: int | None) -> type:
-    """Create each resource-configured Daft class once per process."""
-    return daft.cls(_FragmentUpdateHandler, max_concurrency=max_concurrency)
-
-
 def update_columns_from_df(
     df: daft.DataFrame,
     lance_ds: lance.LanceDataset,
@@ -266,7 +259,7 @@ def update_columns_from_df(
     resolved_columns, expected_field_ids = _validate_update_columns(df, lance_ds, columns)
     source = df.select(*resolved_columns, _ROW_ADDRESS, _FRAGMENT_ID)
 
-    handler_cls = _fragment_update_handler_cls(max_concurrency)
+    handler_cls = daft.cls(_FragmentUpdateHandler, max_concurrency=max_concurrency)
     handler = handler_cls(open_context, resolved_columns)
     grouped = source.groupby(_FRAGMENT_ID).map_groups(
         handler(
