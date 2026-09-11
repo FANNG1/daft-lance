@@ -602,8 +602,8 @@ class TestDistributedIndexing:
         index_names = [idx["name"] for idx in indices]
         assert "score_zonemap_index" in index_names, f"ZONEMAP index not found in {index_names}"
 
-    def test_build_distributed_index_zonemap_invalid_string_column(self, temp_dir):
-        """Test that ZONEMAP index rejects string columns via Lance."""
+    def test_build_distributed_index_zonemap_string_column(self, temp_dir):
+        """Test that ZONEMAP index builds on string columns (supported since Lance 11)."""
         data = {
             "id": [1, 2, 3, 4],
             "text": ["a", "b", "c", "d"],
@@ -612,14 +612,16 @@ class TestDistributedIndexing:
         path = Path(temp_dir) / "zonemap_string_test.lance"
         dataset.write_lance(uri=path, max_rows_per_file=2)
 
-        # ZONEMAP falls back to single-threaded Lance, which will reject
-        # unsupported column types at the Lance level.
-        with pytest.raises(Exception):
-            create_scalar_index(
-                uri=path,
-                column="text",
-                index_type="ZONEMAP",
-            )
+        # ZONEMAP falls back to single-threaded Lance index creation.
+        create_scalar_index(
+            uri=path,
+            column="text",
+            index_type="ZONEMAP",
+            name="text_zonemap_index",
+        )
+
+        index_names = [idx["name"] for idx in lance.dataset(path).list_indices()]
+        assert "text_zonemap_index" in index_names, f"ZONEMAP index not found in {index_names}"
 
 
 class TestSegmentedBTreeIndex:
