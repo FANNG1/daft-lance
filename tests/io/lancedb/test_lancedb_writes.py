@@ -125,8 +125,10 @@ def test_lancedb_write_blob(lance_dataset_path):
 
     row_ids = ds.to_table(columns=[], with_row_id=True).column("_rowid").to_pylist()
     blobs = ds.take_blobs("blob", row_ids)
-    for expected in blobs_data:
-        with blobs.pop(0) as f:
+    assert len(blobs) == len(blobs_data)
+    for blob, expected in zip(blobs, blobs_data):
+        assert blob is not None
+        with blob as f:
             assert f.read() == expected
 
 
