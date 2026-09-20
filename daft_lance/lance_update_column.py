@@ -24,6 +24,7 @@ _FRAGMENT_UPDATE_RESULT_DTYPE = DataType.struct(
     {
         "fragment_meta": DataType.binary(),
         "rows_updated": DataType.int64(),
+        "fields_modified": DataType.list(DataType.int64()),
     }
 )
 
@@ -52,21 +53,11 @@ def _is_blob_field(field: pa.Field[Any]) -> bool:
     return metadata.get(b"lance-encoding:blob") == b"true"
 
 
-def _leaf_field_ids(field: Any) -> list[int]:
-    children = field.children()
-    if not children:
-        return [field.id()]
-    field_ids: list[int] = []
-    for child in children:
-        field_ids.extend(_leaf_field_ids(child))
-    return field_ids
-
-
 def _validate_update_columns(
     df: daft.DataFrame,
     lance_ds: lance.LanceDataset,
     columns: Sequence[str],
-) -> tuple[list[str], list[int]]:
+) -> list[str]:
     if isinstance(columns, str):
         raise TypeError(f"'columns' must be a sequence of column names, not a bare string. Did you mean ['{columns}']?")
 
@@ -87,7 +78,6 @@ def _validate_update_columns(
             raise ValueError(f"Nested field path {name!r} is not supported; only top-level columns can be updated.")
 
     target_names = set(lance_ds.schema.names)
-    field_ids: list[int] = []
     for name in resolved_columns:
         if name not in target_names:
             raise ValueError(
@@ -101,11 +91,6 @@ def _validate_update_columns(
         if _is_blob_field(arrow_field):
             raise ValueError(f"Blob column {name!r} cannot be updated by update_columns_df.")
 
-        lance_field = lance_ds.lance_schema.field(name)  # type: ignore[attr-defined]
-        if lance_field is None:
-            raise ValueError(f"Column {name!r} has no Lance field id.")
-        field_ids.extend(_leaf_field_ids(lance_field))
-
     source_names = df.column_names
     for required in [_ROW_ADDRESS, _FRAGMENT_ID, *resolved_columns]:
         count = source_names.count(required)
@@ -114,7 +99,7 @@ def _validate_update_columns(
         if count > 1:
             raise ValueError(f"DataFrame column {required!r} is ambiguous because it appears {count} times.")
 
-    return resolved_columns, sorted(field_ids)
+    return resolved_columns
 
 
 def _to_arrow_array(series: Any) -> pa.Array[Any]:
@@ -197,7 +182,7 @@ def _rewrite_fragment(
         raise ValueError(f"Update columns cannot be safely cast to the target Lance schema: {exc}") from exc
 
     update_table = values.append_column(_ROW_ADDRESS, batch.row_addresses)
-    fragment_meta, _ = fragment.update_columns(
+    fragment_meta, fields_modified = fragment.update_columns(
         update_table,
         left_on=_ROW_ADDRESS,
         right_on=_ROW_ADDRESS,
@@ -208,6 +193,7 @@ def _rewrite_fragment(
     return {
         "fragment_meta": daft.pickle.dumps(fragment_meta),
         "rows_updated": len(batch.row_addresses),
+        "fields_modified": [int(field_id) for field_id in fields_modified],
     }
 
 
@@ -256,7 +242,7 @@ def update_columns_from_df(
     if max_concurrency is not None and max_concurrency <= 0:
         raise ValueError("max_concurrency must be a positive integer.")
 
-    resolved_columns, expected_field_ids = _validate_update_columns(df, lance_ds, columns)
+    resolved_columns = _validate_update_columns(df, lance_ds, columns)
     source = df.select(*resolved_columns, _ROW_ADDRESS, _FRAGMENT_ID)
 
     handler_cls = daft.cls(_FragmentUpdateHandler, max_concurrency=max_concurrency)
@@ -274,6 +260,7 @@ def update_columns_from_df(
 
     updated_fragments = []
     seen_fragment_ids: set[int] = set()
+    fields_modified: set[int] = set()
     rows_updated = 0
     for message in commit_messages:
         fragment_meta = daft.pickle.loads(message["fragment_meta"])
@@ -283,11 +270,12 @@ def update_columns_from_df(
         seen_fragment_ids.add(fragment_id)
 
         updated_fragments.append(fragment_meta)
+        fields_modified.update(int(field_id) for field_id in message["fields_modified"])
         rows_updated += int(message["rows_updated"])
 
     operation = lance.LanceOperation.Update(
         updated_fragments=updated_fragments,
-        fields_modified=expected_field_ids,
+        fields_modified=sorted(fields_modified),
         fields_for_preserving_frag_bitmap=[],
         update_mode="rewrite_columns",
     )
