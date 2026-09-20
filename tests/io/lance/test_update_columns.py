@@ -199,6 +199,7 @@ def test_update_columns_df_rejects_invalid_addresses(
         ([], "at least one"),
         (["missing"], "non-existent"),
         (["_rowaddr"], "metadata column"),
+        (["fragment_id"], "grouping key"),
         (["value", "value"], "Duplicate column"),
     ],
 )
@@ -213,6 +214,26 @@ def test_update_columns_df_validates_targets_before_execution(
 
     with pytest.raises((TypeError, ValueError), match=message):
         daft_lance.update_columns_df(source, path, columns=columns)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"columns": "value"}, "bare string"),
+        ({"columns": ["value"], "max_concurrency": 0}, "max_concurrency"),
+    ],
+)
+def test_update_columns_df_validates_arguments_before_opening_dataset(
+    tmp_path: Path,
+    kwargs: dict[str, Any],
+    message: str,
+) -> None:
+    missing = str(tmp_path / "never-opened.lance")
+
+    with pytest.raises((TypeError, ValueError), match=message):
+        daft_lance.update_columns_df(daft.from_pydict({"id": [1]}), missing, **kwargs)
+
+    assert not Path(missing).exists()
 
 
 def test_update_columns_df_safe_casts_to_target_type(tmp_path: Path) -> None:
@@ -289,6 +310,29 @@ def test_update_columns_df_rejects_deleted_row_address(tmp_path: Path) -> None:
     assert lance.dataset(path).version == version_after_delete
 
 
+def test_update_columns_df_rejects_address_from_another_fragment(tmp_path: Path) -> None:
+    path = str(tmp_path / "cross-fragment-address.lance")
+    daft.from_pydict({"id": [1, 2], "value": [10, 20]}).write_lance(path, max_rows_per_file=1)
+    version = lance.dataset(path).version
+    addresses = _read_update_source(path).select("_rowaddr", "fragment_id").sort("_rowaddr").to_pydict()
+    assert addresses["fragment_id"] == [0, 1]
+
+    # Fragment 0's address routed to fragment 1's worker: the high 32 bits do not
+    # match the fragment being rewritten.
+    source = daft.from_pydict(
+        {
+            "_rowaddr": [addresses["_rowaddr"][0]],
+            "fragment_id": [1],
+            "value": [999],
+        }
+    )
+
+    with pytest.raises(Exception, match="not live rows in fragment 1"):
+        daft_lance.update_columns_df(source, path, columns=["value"])
+
+    assert lance.dataset(path).version == version
+
+
 def test_update_columns_df_rejects_null_for_non_nullable_target(tmp_path: Path) -> None:
     path = str(tmp_path / "non-nullable.lance")
     schema = pa.schema(
@@ -307,10 +351,13 @@ def test_update_columns_df_rejects_null_for_non_nullable_target(tmp_path: Path) 
         ),
         path,
     )
+    version = lance.dataset(path).version
     source = _read_update_source(path).select("_rowaddr", "fragment_id").with_column("value", daft.lit(None))
 
     with pytest.raises(Exception, match="non-nullable column 'value'"):
         daft_lance.update_columns_df(source, path, columns=["value"])
+
+    assert lance.dataset(path).version == version
 
 
 def test_update_columns_df_namespace_roundtrip(tmp_path: Path) -> None:

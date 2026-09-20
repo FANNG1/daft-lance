@@ -11,7 +11,7 @@ import daft.pickle
 from daft.datatype import DataType
 from daft.dependencies import pa
 from daft.udf import method
-from daft_lance._blob import is_blob_v2_field
+from daft_lance._metadata import _is_lance_blob
 
 if TYPE_CHECKING:
     from daft_lance.namespace import DatasetOpenContext
@@ -46,18 +46,15 @@ class _FragmentUpdateBatch:
     values: pa.Table
 
 
-def _is_blob_field(field: pa.Field[Any]) -> bool:
-    if is_blob_v2_field(field):
-        return True
-    metadata = field.metadata or {}
-    return metadata.get(b"lance-encoding:blob") == b"true"
+def validate_update_arguments(columns: Sequence[str], max_concurrency: int | None) -> list[str]:
+    """Check the arguments that do not depend on the target dataset.
 
+    Called before the dataset is opened so a bad argument does not first cost a
+    namespace round trip and a manifest read.
+    """
+    if max_concurrency is not None and max_concurrency <= 0:
+        raise ValueError("max_concurrency must be a positive integer.")
 
-def _validate_update_columns(
-    df: daft.DataFrame,
-    lance_ds: lance.LanceDataset,
-    columns: Sequence[str],
-) -> list[str]:
     if isinstance(columns, str):
         raise TypeError(f"'columns' must be a sequence of column names, not a bare string. Did you mean ['{columns}']?")
 
@@ -72,10 +69,26 @@ def _validate_update_columns(
         if name in seen:
             raise ValueError(f"Duplicate column {name!r} in 'columns'.")
         seen.add(name)
+        if name == _FRAGMENT_ID:
+            raise ValueError(
+                f"Cannot update {name!r}; it is the grouping key update_columns_df injects, "
+                "not a column of the target dataset."
+            )
         if name in _METADATA_COLUMNS:
             raise ValueError(f"Cannot update metadata column {name!r}.")
         if "." in name:
             raise ValueError(f"Nested field path {name!r} is not supported; only top-level columns can be updated.")
+
+    return resolved_columns
+
+
+def _validate_update_columns(
+    df: daft.DataFrame,
+    lance_ds: lance.LanceDataset,
+    columns: Sequence[str],
+    max_concurrency: int | None = None,
+) -> list[str]:
+    resolved_columns = validate_update_arguments(columns, max_concurrency)
 
     target_names = set(lance_ds.schema.names)
     for name in resolved_columns:
@@ -84,11 +97,9 @@ def _validate_update_columns(
                 f"Cannot update non-existent column {name!r}; update_columns_df only overwrites existing columns."
             )
         arrow_field = lance_ds.schema.field(name)
-        if arrow_field is None:
-            raise ValueError(f"Column {name!r} has no Arrow field in the target schema.")
         if pa.types.is_struct(arrow_field.type):
             raise ValueError(f"Struct column {name!r} is not supported by update_columns_df.")
-        if _is_blob_field(arrow_field):
+        if _is_lance_blob(arrow_field):
             raise ValueError(f"Blob column {name!r} cannot be updated by update_columns_df.")
 
     source_names = df.column_names
@@ -103,8 +114,6 @@ def _validate_update_columns(
 
 
 def _to_arrow_array(series: Any) -> pa.Array[Any]:
-    from daft.dependencies import pa
-
     array = series.to_arrow()
     if isinstance(array, pa.ChunkedArray):
         return array.combine_chunks()
@@ -138,10 +147,21 @@ def _validate_live_row_addresses(
     version: int,
 ) -> None:
     """Require every requested address to identify a live row in the pinned fragment."""
-    live_row_addresses = (
-        fragment.scanner(columns=[], with_row_address=True).to_table().column(_ROW_ADDRESS).combine_chunks()
-    )
-    addresses_are_live = pa.compute.is_in(row_addresses, value_set=live_row_addresses)
+    metadata = fragment.metadata
+    if metadata.deletion_file is None and metadata.physical_rows is not None:
+        # Without a deletion vector every offset below physical_rows is live, so
+        # the live addresses are exactly one contiguous range and no row scan is
+        # needed to check membership.
+        first = fragment_id << 32
+        addresses_are_live = pa.compute.and_(
+            pa.compute.greater_equal(row_addresses, pa.scalar(first, type=pa.uint64())),
+            pa.compute.less(row_addresses, pa.scalar(first + metadata.physical_rows, type=pa.uint64())),
+        )
+    else:
+        live_row_addresses = (
+            fragment.scanner(columns=[], with_row_address=True).to_table().column(_ROW_ADDRESS).combine_chunks()
+        )
+        addresses_are_live = pa.compute.is_in(row_addresses, value_set=live_row_addresses)
     if bool(pa.compute.all(addresses_are_live).as_py()):
         return
 
@@ -239,10 +259,7 @@ def update_columns_from_df(
     max_concurrency: int | None = None,
 ) -> UpdateColumnsResult:
     """Execute a distributed, DataFrame-driven RewriteColumns transaction."""
-    if max_concurrency is not None and max_concurrency <= 0:
-        raise ValueError("max_concurrency must be a positive integer.")
-
-    resolved_columns = _validate_update_columns(df, lance_ds, columns)
+    resolved_columns = _validate_update_columns(df, lance_ds, columns, max_concurrency)
     source = df.select(*resolved_columns, _ROW_ADDRESS, _FRAGMENT_ID)
 
     handler_cls = daft.cls(_FragmentUpdateHandler, max_concurrency=max_concurrency)
