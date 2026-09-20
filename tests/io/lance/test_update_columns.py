@@ -105,6 +105,46 @@ def test_update_columns_df_partial_multi_fragment(tmp_path: Path) -> None:
     assert old["score"] == [1.0, 2.0, 3.0, 4.0]
 
 
+def _fragment_files(path: str, version: int | None = None) -> dict[int, set[str]]:
+    dataset = lance.dataset(path) if version is None else lance.dataset(path, version=version)
+    return {
+        fragment.fragment_id: {data_file["path"] for data_file in fragment.metadata.to_json()["files"]}
+        for fragment in dataset.get_fragments()
+    }
+
+
+def test_update_columns_df_preserves_untouched_fragments(tmp_path: Path) -> None:
+    path = str(tmp_path / "untouched-fragments.lance")
+    daft.from_pydict(
+        {
+            "id": list(range(8)),
+            "value": [value * 10 for value in range(8)],
+        }
+    ).write_lance(path, max_rows_per_file=2)
+
+    before_version = lance.dataset(path).version
+    before_files = _fragment_files(path)
+    assert len(before_files) == 4
+
+    source = _read_update_source(path).where("id = 2").with_column("value", daft.lit(999))
+    result = daft_lance.update_columns_df(source, path, columns=["value"])
+
+    assert result == daft_lance.UpdateColumnsResult(version=before_version + 1, rows_updated=1)
+    after_files = _fragment_files(path)
+
+    assert set(after_files) == set(before_files)
+    updated = {fragment_id for fragment_id, files in after_files.items() if files != before_files[fragment_id]}
+    assert updated == {1}
+    for fragment_id in set(before_files) - updated:
+        assert after_files[fragment_id] == before_files[fragment_id]
+
+    assert lance.dataset(path).to_table().sort_by("id").to_pydict() == {
+        "id": list(range(8)),
+        "value": [0, 10, 999, 30, 40, 50, 60, 70],
+    }
+    assert _fragment_files(path, version=before_version) == before_files
+
+
 def test_update_columns_df_empty_is_noop(tmp_path: Path) -> None:
     path = str(tmp_path / "empty-update.lance")
     daft.from_pydict({"id": [1, 2], "value": [10, 20]}).write_lance(path)
@@ -296,7 +336,7 @@ def test_update_columns_df_namespace_roundtrip(tmp_path: Path) -> None:
     assert daft_lance.read_lance(**namespace).sort("id").to_pydict()["value"] == [100, 200]
 
 
-def test_update_columns_df_fixed_size_list_uses_leaf_field_ids(tmp_path: Path) -> None:
+def test_update_columns_df_fixed_size_list_column(tmp_path: Path) -> None:
     path = str(tmp_path / "fixed-size-list.lance")
     vector_type = pa.list_(pa.float32(), 2)
     lance.write_dataset(
