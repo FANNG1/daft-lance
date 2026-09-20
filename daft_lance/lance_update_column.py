@@ -98,6 +98,10 @@ def _validate_update_columns(
             )
         arrow_field = lance_ds.schema.field(name)
         if pa.types.is_struct(arrow_field.type):
+            # A source struct missing one of the target's fields casts cleanly
+            # with that field filled in as null, so a partial struct would drop
+            # data silently. Supporting structs needs an explicit field-set
+            # check first.
             raise ValueError(f"Struct column {name!r} is not supported by update_columns_df.")
         if _is_lance_blob(arrow_field):
             raise ValueError(f"Blob column {name!r} cannot be updated by update_columns_df.")

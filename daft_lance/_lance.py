@@ -426,7 +426,10 @@ def update_columns_df(
         columns: Existing top-level columns to overwrite. Values are cast to
             the target Arrow types with ``safe=True``. Arrow does not detect
             every lossy float narrowing conversion, so produce the target float
-            type explicitly when precision matters.
+            type explicitly when precision matters. Struct columns are rejected:
+            casting a source struct to the target type fills any field the
+            source omits with nulls, which would silently drop data the caller
+            did not intend to overwrite.
         table_id: Namespace table identifier.
         namespace_impl: Lance Namespace implementation.
         namespace_properties: Properties used to connect to the namespace.

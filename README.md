@@ -88,6 +88,10 @@ result = update_columns_df(
 print(result.version, result.rows_updated)
 ```
 
+Struct columns are not supported: a source struct that omits one of the
+target's fields casts cleanly with that field set to null, which would silently
+drop data the caller never meant to overwrite.
+
 The source `_rowaddr` values must all be unique live rows in the pinned target
 snapshot. The update is committed atomically using Lance `RewriteColumns`.
 Stable-row-ID datasets are rejected before any fragments are written because
