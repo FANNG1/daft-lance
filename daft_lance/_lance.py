@@ -18,7 +18,7 @@ from .lance_data_sink import LanceDataSink
 from .lance_merge_column import merge_columns_from_df, merge_columns_internal
 from .lance_scalar_index import create_scalar_index_internal
 from .lance_scan import LanceScanOperator
-from .lance_update_column import UpdateColumnsResult, update_columns_from_df
+from .lance_update_column import UpdateColumnsResult, update_columns_from_df, validate_update_arguments
 from .namespace import validate_uri_or_namespace
 from .utils import construct_lance_dataset_handle
 
@@ -402,7 +402,12 @@ def update_columns_df(
     namespace_properties: dict[str, str] | None = None,
     storage_options: dict[str, Any] | None = None,
     version: int | str | None = None,
+    asof: str | None = None,
+    block_size: int | None = None,
     commit_lock: Any | None = None,
+    index_cache_size: int | None = None,
+    default_scan_options: dict[str, Any] | None = None,
+    metadata_cache_size_bytes: int | None = None,
     max_concurrency: int | None = None,
 ) -> UpdateColumnsResult:
     """Overwrite existing Lance columns using values from a Daft DataFrame.
@@ -426,12 +431,28 @@ def update_columns_df(
         namespace_impl: Lance Namespace implementation.
         namespace_properties: Properties used to connect to the namespace.
         storage_options: Additional object-store options.
-        version: Target dataset version or tag. Defaults to the current version.
+        version: Dataset version or tag to read and commit against. Defaults to
+            the current version. It must be the snapshot the source ``_rowaddr``
+            values were read from. Lance rebases the commit over concurrent
+            transactions that touch other fragments; a concurrent write to a
+            fragment this update rewrites raises ``CommitConflictError``.
+        asof: If specified, find the latest version created on or earlier than the given argument value.
+        block_size: Block size in bytes. Provide a hint for the size of the minimal I/O request.
         commit_lock: Custom Lance commit lock.
-        max_concurrency: Maximum number of fragment-update worker processes.
+        index_cache_size: Index cache size.
+        default_scan_options: Default scan options.
+        metadata_cache_size_bytes: Size of the metadata cache in bytes.
+        max_concurrency: Maximum number of concurrent fragment-update workers.
 
     Returns:
         The committed dataset version and exact number of updated live rows.
+
+    Note:
+        Fragments are validated and rewritten in parallel, so a failure raised
+        by one fragment can leave data files other fragments already wrote
+        behind. Nothing is committed and the dataset version does not change;
+        the unreferenced files stay until Lance cleans them up (see
+        ``LanceDataset.cleanup_old_versions``).
 
     Raises:
         NotImplementedError: If the target dataset uses stable row IDs. The
@@ -454,6 +475,7 @@ def update_columns_df(
         ...     columns=["label"],
         ... )
     """
+    resolved_columns = validate_update_arguments(columns, max_concurrency)
     io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
     dataset_handle = construct_lance_dataset_handle(
         uri,
@@ -463,7 +485,12 @@ def update_columns_df(
         namespace_properties=namespace_properties,
         table_id=table_id,
         version=version,
+        asof=asof,
+        block_size=block_size,
         commit_lock=commit_lock,
+        index_cache_size=index_cache_size,
+        default_scan_options=default_scan_options,
+        metadata_cache_size_bytes=metadata_cache_size_bytes,
     )
     if dataset_handle.dataset.has_stable_row_ids:
         raise NotImplementedError(
@@ -476,7 +503,7 @@ def update_columns_df(
         df,
         dataset_handle.dataset,
         dataset_handle.worker_open_context(),
-        columns=columns,
+        columns=resolved_columns,
         commit_lock=commit_lock,
         max_concurrency=max_concurrency,
     )

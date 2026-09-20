@@ -94,6 +94,12 @@ Stable-row-ID datasets are rejected before any fragments are written because
 current pylance bindings cannot propagate the offsets required to advance
 `_row_last_updated_at_version` and keep CDF metadata correct.
 
+Fragments are rewritten in parallel, so an invalid `_rowaddr` (or any other
+per-fragment failure) can surface after other fragments have already written
+their new column files. Nothing is committed and the dataset version does not
+move, but those unreferenced files stay on storage until Lance cleans them up
+via `LanceDataset.cleanup_old_versions`.
+
 ### Namespace Tables
 
 Address Lance tables through a [Lance Namespace](https://lancedb.github.io/lance-namespace/)
