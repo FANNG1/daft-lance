@@ -24,11 +24,31 @@ compact_files("s3://bucket/my_dataset")
 
 ### Scalar Indexing
 
+Every supported index type is built distributed: Daft workers build
+independent index segments and the coordinator commits them atomically with
+complete metadata. Supported types: `BITMAP`, `BTREE`, `INVERTED`, `FTS`,
+`ZONEMAP`, `NGRAM`, `LABEL_LIST`, `BLOOMFILTER`.
+
 ```python
 from daft_lance import create_scalar_index
 
 create_scalar_index("s3://bucket/my_dataset", column="name", index_type="INVERTED")
+create_scalar_index("s3://bucket/my_dataset", column="ts", index_type="ZONEMAP")
 ```
+
+`replace=True` (the default) atomically swaps an existing index of the same
+name: the segment commit retires the old overlapped segments in the same
+transaction as the new ones. `replace=False` rejects an existing name. Types
+without a distributed path (e.g. `RTREE`) raise `ValueError` — call pylance
+directly (`lance.dataset(uri).create_scalar_index(...)`) for single-node
+indexing.
+
+> **Breaking change (from 0.5.0):** the `segmented` parameter was removed —
+> the distributed segment-index workflow is now the only code path, and the
+> single-node fallbacks are gone. `replace` now defaults to `True` (matching
+> pylance). Indexes created by older versions of
+> `create_scalar_index` on `INVERTED` columns may carry empty index metadata
+> (see #69); rebuilding them with `replace=True` records full metadata.
 
 ### Column Merging
 

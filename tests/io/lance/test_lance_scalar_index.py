@@ -4,6 +4,7 @@ import pickle
 import tempfile
 from inspect import signature
 from pathlib import Path
+from typing import Any, cast
 
 import lance
 import pytest
@@ -14,7 +15,6 @@ from daft_lance import create_scalar_index, lance_scalar_index
 from daft_lance.lance_scalar_index import (
     SegmentedFragmentIndexHandler,
     _existing_index_names,
-    _prepare_index_segments_for_commit,
     create_scalar_index_internal,
 )
 from daft_lance.namespace import DatasetOpenContext
@@ -105,10 +105,21 @@ def generate_multi_fragment_dataset(tmp_path, num_fragments=4, rows_per_fragment
 class TestDistributedIndexing:
     """Test cases for distributed indexing functionality."""
 
-    def test_replace_defaults_to_false(self):
-        """Test that scalar index replacement is opt-in."""
-        assert signature(create_scalar_index).parameters["replace"].default is False
-        assert signature(create_scalar_index_internal).parameters["replace"].default is False
+    def test_replace_defaults_to_true(self) -> None:
+        """Replacement is opt-out, matching pylance's default."""
+        assert signature(create_scalar_index).parameters["replace"].default is True
+        assert signature(create_scalar_index_internal).parameters["replace"].default is True
+
+    def test_segmented_kwarg_is_rejected_loudly(self) -> None:
+        """The removed segmented parameter must fail at the API boundary."""
+        with pytest.raises(TypeError, match="'segmented' parameter was removed"):
+            create_scalar_index_internal(
+                lance_ds=cast(Any, None),
+                open_context=cast(Any, None),
+                column="a",
+                index_type="INVERTED",
+                segmented=True,
+            )
 
     def test_build_distributed_index_search_functionality(self, multi_fragment_lance_dataset):
         """Test that the built index actually works for searching."""
@@ -548,7 +559,7 @@ class TestDistributedIndexing:
         assert len(indices) == 0, f"Expected no indices for empty dataset, got {len(indices)}"
 
     def test_build_distributed_index_zonemap_type(self, temp_dir):
-        """Test building ZONEMAP index on numeric column (falls back to single-threaded)."""
+        """Test building ZONEMAP index distributed on a numeric column."""
         data = {
             "id": [1, 2, 3, 4, 5, 6, 7, 8],
             "price": [10.5, 20.75, 30.0, 40.25, 50.5, 60.75, 70.0, 80.25],
@@ -558,8 +569,6 @@ class TestDistributedIndexing:
         path = Path(temp_dir) / "zonemap_test.lance"
         dataset.write_lance(uri=path, max_rows_per_file=2)
 
-        # ZONEMAP is not supported by merge_index_metadata, so it falls back
-        # to single-threaded creation via Lance's create_scalar_index.
         create_scalar_index(
             uri=path,
             column="price",
@@ -581,7 +590,7 @@ class TestDistributedIndexing:
         assert results.num_rows > 0, "No results found for ZONEMAP index query"
 
     def test_build_distributed_index_zonemap_integer_column(self, temp_dir):
-        """Test building ZONEMAP index on integer column (falls back to single-threaded)."""
+        """Test building ZONEMAP index distributed on an integer column."""
         data = {
             "id": [1, 2, 3, 4, 5, 6, 7, 8],
             "score": [100, 200, 300, 400, 500, 600, 700, 800],
@@ -666,37 +675,16 @@ class TestSegmentedBTreeIndex:
             }
         ]
 
-    def test_segmented_inverted_segments_are_merged_before_commit(self):
-        """Test that INVERTED segments are merged into one physical segment before commit."""
+    def test_segments_are_committed_without_merge(self):
+        """Worker-built segments commit as-is, with no merge step.
 
-        class FakeLanceDataset:
-            def __init__(self):
-                self.calls = []
-
-            def merge_existing_index_segments(self, segments):
-                self.calls.append(segments)
-                return {"segment": "merged"}
-
-        fake_ds = FakeLanceDataset()
-        segments = [{"segment": "a"}, {"segment": "b"}]
-
-        prepared = _prepare_index_segments_for_commit(fake_ds, "INVERTED", segments)
-
-        assert prepared == [{"segment": "merged"}]
-        assert fake_ds.calls == [segments]
-
-    def test_segmented_btree_segments_are_committed_without_merge(self):
-        """Test that non-merged segmented index types keep their physical segments."""
-
-        class FakeLanceDataset:
-            def merge_existing_index_segments(self, segments):
-                raise AssertionError("BTREE segments must not be merged")
-
-        segments = [{"segment": "a"}, {"segment": "b"}]
-
-        prepared = _prepare_index_segments_for_commit(FakeLanceDataset(), "BTREE", segments)
-
-        assert prepared is segments
+        Multi-segment indexes are fully functional (verified: split segments
+        load and prune at query time with identical scores); compaction is
+        left to optimize_indices.
+        """
+        # The merge helper is gone from the module entirely.
+        assert not hasattr(lance_scalar_index, "_prepare_index_segments_for_commit")
+        assert not hasattr(lance_scalar_index, "MERGED_SEGMENTED_INDEX_TYPES")
 
     def test_existing_index_names_falls_back_to_list_indices(self):
         """Test that existing-name checks still work for legacy indexes with bad details."""
@@ -710,16 +698,12 @@ class TestSegmentedBTreeIndex:
 
         assert _existing_index_names(FakeLanceDataset()) == {"legacy_idx"}
 
-    def test_segmented_bitmap_handler_forwards_shard_id(self):
-        """Test that BITMAP segment creation forwards the required shard id."""
+    def test_segmented_bitmap_handler_builds_without_shard_id(self):
+        """BITMAP segment creation needs no shard id; segments commit as-is."""
 
         class FakeLanceDataset:
-            def __init__(self):
+            def __init__(self) -> None:
                 self.calls = []
-
-            @property
-            def _ds(self):
-                raise AssertionError("public BITMAP segment creation should not use fallback")
 
             def create_index_uncommitted(self, **kwargs):
                 self.calls.append(kwargs)
@@ -733,7 +717,7 @@ class TestSegmentedBTreeIndex:
             name="flag_idx",
         )
 
-        raw_segment = handler([1, 2], shard_id=7)
+        raw_segment = handler([1, 2])
 
         assert pickle.loads(raw_segment) == {"segment": "bitmap-metadata"}
         assert fake_ds.calls == [
@@ -744,37 +728,17 @@ class TestSegmentedBTreeIndex:
                 "replace": False,
                 "train": True,
                 "fragment_ids": [1, 2],
-                "shard_id": 7,
             }
         ]
-
-    def test_segmented_bitmap_segments_are_merged_before_commit(self):
-        """Test that BITMAP segments are merged to avoid one physical segment per fragment."""
-
-        class FakeLanceDataset:
-            def __init__(self):
-                self.calls = []
-
-            def merge_existing_index_segments(self, segments):
-                self.calls.append(segments)
-                return {"segment": "merged-bitmap"}
-
-        fake_ds = FakeLanceDataset()
-        segments = [{"segment": "a"}, {"segment": "b"}]
-
-        prepared = _prepare_index_segments_for_commit(fake_ds, "BITMAP", segments)
-
-        assert prepared == [{"segment": "merged-bitmap"}]
-        assert fake_ds.calls == [segments]
 
     def test_segmented_bitmap_respects_fragment_group_size(self, monkeypatch):
         """Test that segmented BITMAP can group multiple fragments per segment."""
 
         class FakeFragment:
-            def __init__(self, fragment_id):
+            def __init__(self, fragment_id: int) -> None:
                 self.fragment_id = fragment_id
 
-            def count_rows(self):
+            def count_rows(self) -> int:
                 return 1
 
         class FakeLanceDataset:
@@ -799,34 +763,54 @@ class TestSegmentedBTreeIndex:
             column="flag",
             index_type="BITMAP",
             name="flag_bitmap_idx",
-            segmented=True,
             fragment_group_size=2,
         )
 
         assert [len(group["fragment_ids"]) for group in calls[0]["fragment_data"]] == [2, 2]
 
-    def test_bitmap_replace_true_existing_index_preserves_lance_replacement(self):
-        """Test that default BITMAP indexing keeps replace=True behavior for existing indexes."""
+    def test_replace_true_uses_atomic_overlap_replacement(self, monkeypatch):
+        """replace=True replaces atomically, without dropping the old index.
+
+        The segment commit retires the overlapped segments in the same
+        transaction.
+        """
+
+        class FakeSegment:
+            def __init__(self, fragment_ids: set[int]) -> None:
+                self.fragment_ids = fragment_ids
 
         class ExistingIndex:
             name = "flag_bitmap_idx"
+            segments = [FakeSegment({0, 1})]
+
+        class FakeFragment:
+            def __init__(self, fragment_id: int) -> None:
+                self.fragment_id = fragment_id
+
+            def count_rows(self) -> int:
+                return 1
 
         class FakeLanceDataset:
             schema = pa.schema([("flag", pa.int64())])
 
-            def __init__(self):
-                self.calls = []
+            def __init__(self) -> None:
+                self.dropped: list[str] = []
 
-            def describe_indices(self):
+            def describe_indices(self) -> list[Any]:
                 return [ExistingIndex()]
 
-            def create_scalar_index(self, **kwargs):
-                self.calls.append(kwargs)
+            def drop_index(self, name: str) -> None:
+                self.dropped.append(name)
+
+            def get_fragments(self) -> list[Any]:
+                return [FakeFragment(0), FakeFragment(1)]
 
         fake_ds = FakeLanceDataset()
+        calls = []
+        monkeypatch.setattr(lance_scalar_index, "_create_segmented_index", lambda **kwargs: calls.append(kwargs))
 
         create_scalar_index_internal(
-            lance_ds=fake_ds,
+            lance_ds=cast(Any, fake_ds),
             open_context=DatasetOpenContext(uri="memory://bitmap", version=1),
             column="flag",
             index_type="BITMAP",
@@ -834,39 +818,32 @@ class TestSegmentedBTreeIndex:
             replace=True,
         )
 
-        assert fake_ds.calls == [
-            {
-                "column": "flag",
-                "index_type": "BITMAP",
-                "name": "flag_bitmap_idx",
-                "replace": True,
-            }
-        ]
+        # No drop: overlap replacement retires the old segments atomically.
+        assert fake_ds.dropped == []
+        # Workers still build with replace=True: the pinned snapshot has the name.
+        assert calls[0]["handler_replace"] is True
 
-    def test_bitmap_replace_true_default_name_preserves_lance_replacement(self, temp_dir):
-        """Test that default BITMAP replacement preserves Lance's default index name."""
+    def test_replace_true_rebuilds_single_index_with_same_name(self, temp_dir):
+        """Replacing an index must leave exactly one index behind, same name."""
         path = Path(temp_dir) / "bitmap_default_replace.lance"
         table = pa.table(
             {
-                "flag": pa.array([1, 2, 1, 3], type=pa.int64()),
+                "flag": pa.array([1, 2, 1, 3, 2, 1, 3, 2], type=pa.int64()),
             }
         )
         lance.write_dataset(table, str(path), max_rows_per_file=2)
 
-        initial_dataset = lance.dataset(str(path))
-        initial_dataset.create_scalar_index(column="flag", index_type="BITMAP")
-        initial_names = [idx["name"] for idx in lance.dataset(str(path)).list_indices()]
-        assert len(initial_names) == 1
+        create_scalar_index(uri=path, column="flag", index_type="BITMAP", name="flag_idx")
+        assert len(lance.dataset(str(path)).describe_indices()) == 1
 
-        create_scalar_index(
-            uri=path,
-            column="flag",
-            index_type="BITMAP",
-            replace=True,
-        )
+        create_scalar_index(uri=path, column="flag", index_type="BITMAP", name="flag_idx")
 
-        final_names = [idx["name"] for idx in lance.dataset(str(path)).list_indices()]
-        assert final_names == initial_names
+        described = lance.dataset(str(path)).describe_indices()
+        assert len(described) == 1
+        assert described[0].name == "flag_idx"
+        assert described[0].num_rows_indexed == 8
+        results = lance.dataset(str(path)).scanner(filter="flag = 1").to_table()
+        assert results.num_rows == 3
 
     def test_segmented_btree_basic(self, temp_dir):
         """Test basic segmented BTree index creation and query."""
@@ -884,7 +861,6 @@ class TestSegmentedBTreeIndex:
             column="price",
             index_type="BTREE",
             name="price_seg_idx",
-            segmented=True,
             max_concurrency=2,
         )
 
@@ -920,7 +896,6 @@ class TestSegmentedBTreeIndex:
             column="score",
             index_type="BTREE",
             name="score_seg_idx",
-            segmented=True,
             fragment_group_size=2,
             max_concurrency=2,
         )
@@ -957,7 +932,6 @@ class TestSegmentedBTreeIndex:
             column="value",
             index_type="BTREE",
             name="value_idx",
-            segmented=True,
         )
 
         updated_dataset = lance.dataset(path)
@@ -970,8 +944,8 @@ class TestSegmentedBTreeIndex:
         assert desc.type_url == "/lance.table.BTreeIndexDetails"
         assert desc.num_rows_indexed == 4
 
-    def test_segmented_btree_replace_existing_is_rejected(self, temp_dir):
-        """Test that replacing an existing segmented BTree index fails safely."""
+    def test_btree_replace_semantics(self, temp_dir):
+        """replace=False rejects an existing name; replace=True rebuilds it."""
         data = {
             "id": [1, 2, 3, 4, 5, 6, 7, 8],
             "price": [10.5, 20.75, 30.0, 40.25, 50.5, 60.75, 70.0, 80.25],
@@ -980,36 +954,92 @@ class TestSegmentedBTreeIndex:
         path = Path(temp_dir) / "segmented_btree_replace.lance"
         dataset.write_lance(uri=path, max_rows_per_file=2)
 
-        # Create initial index
         create_scalar_index(
             uri=path,
             column="price",
             index_type="BTREE",
             name="price_idx",
-            segmented=True,
         )
+        assert len(lance.dataset(path).describe_indices()) == 1
 
-        ds1 = lance.dataset(path)
-        assert len(ds1.describe_indices()) == 1
-
-        with pytest.raises(ValueError, match="cannot atomically replace existing index"):
+        # replace=False refuses to touch the existing index.
+        with pytest.raises(ValueError, match="already exists. Set replace=True"):
             create_scalar_index(
                 uri=path,
                 column="price",
                 index_type="BTREE",
                 name="price_idx",
-                segmented=True,
-                replace=True,
+                replace=False,
             )
 
+        # Default (replace=True) drops and rebuilds; still exactly one index.
+        create_scalar_index(
+            uri=path,
+            column="price",
+            index_type="BTREE",
+            name="price_idx",
+        )
         ds2 = lance.dataset(path)
         described = ds2.describe_indices()
         assert len(described) == 1
         assert described[0].name == "price_idx"
 
-        # Query still works after the rejected replacement
         results = ds2.scanner(filter="price > 50.0", columns=["id", "price"]).to_table()
         assert results.num_rows == 4
+
+    def test_replace_rebuild_advances_version_exactly_once(self, temp_dir):
+        """Atomic overlap replacement lands as a single new dataset version."""
+        data = {
+            "id": [1, 2, 3, 4, 5, 6, 7, 8],
+            "price": [10.5, 20.75, 30.0, 40.25, 50.5, 60.75, 70.0, 80.25],
+        }
+        dataset = daft.from_pydict(data)
+        path = Path(temp_dir) / "atomic_replace.lance"
+        dataset.write_lance(uri=path, max_rows_per_file=2)
+
+        create_scalar_index(uri=path, column="price", index_type="BTREE", name="atomic_idx")
+        version_before = lance.dataset(path).version
+
+        create_scalar_index(uri=path, column="price", index_type="BTREE", name="atomic_idx")
+
+        latest = lance.dataset(path)
+        # One transaction: no intermediate drop version, no append duplication.
+        assert latest.version == version_before + 1
+        described = latest.describe_indices()
+        assert len(described) == 1
+        assert described[0].name == "atomic_idx"
+        assert len(described[0].segments) == 1
+        assert latest.scanner(filter="price > 50.0", columns=["id", "price"]).to_table().num_rows == 4
+
+    def test_replace_with_stale_coverage_rebuilds_atomically(self, temp_dir) -> None:
+        """Stale coverage from a fully deleted fragment retires atomically.
+
+        A fully deleted fragment inside a mixed segment is the only stale
+        coverage normal operations produce; the rebuild retires it without a
+        drop, in exactly one new version.
+        """
+        data = {
+            "id": list(range(80)),
+            "name": [f"name-{i % 8}" for i in range(80)],
+        }
+        path = Path(temp_dir) / "stale_coverage.lance"
+        lance.write_dataset(daft.from_pydict(data).to_arrow(), str(path), max_rows_per_file=20)
+
+        create_scalar_index(uri=path, column="name", index_type="INVERTED", name="stale_idx")
+        # Delete every row of fragment 0: the committed segment keeps its
+        # (now partially dead) coverage {0,1,2,3}.
+        lance.dataset(str(path)).delete("id < 20")
+
+        version_before = lance.dataset(str(path)).version
+        create_scalar_index(uri=path, column="name", index_type="INVERTED", name="stale_idx")
+
+        latest = lance.dataset(str(path))
+        assert latest.version == version_before + 1
+        described = latest.describe_indices()[0]
+        assert len(described.segments) == 1
+        assert sorted(described.segments[0].fragment_ids) == [1, 2, 3]
+        # ids 3, 11, 19 (name-3) were among the 20 deleted rows: 10 - 3 remain.
+        assert latest.scanner(filter="name = 'name-3'").to_table().num_rows == 7
 
     def test_segmented_btree_string_column(self, temp_dir):
         """Test segmented BTree index on a string column."""
@@ -1030,7 +1060,6 @@ class TestSegmentedBTreeIndex:
             column="category",
             index_type="BTREE",
             name="cat_idx",
-            segmented=True,
         )
 
         updated_dataset = lance.dataset(path)
@@ -1054,7 +1083,6 @@ class TestSegmentedBTreeIndex:
             column="count",
             index_type="BTREE",
             name="count_idx",
-            segmented=True,
         )
 
         updated_dataset = lance.dataset(path)
@@ -1065,42 +1093,18 @@ class TestSegmentedBTreeIndex:
         results = updated_dataset.scanner(filter="count > 500", columns=["id", "count"]).to_table()
         assert results.num_rows == 3  # 600, 700, 800
 
-    def test_segmented_false_uses_lance_scalar_flow_for_btree(self, monkeypatch):
-        """Test that segmented=False opts out of distributed BTREE workflows."""
-
-        class FakeLanceDataset:
-            schema = pa.schema([("price", pa.float64())])
-
-            def describe_indices(self):
-                return []
-
-            def create_scalar_index(self, **kwargs):
-                calls.append(("lance_scalar", kwargs))
-
-        calls = []
-
-        def fake_create_segmented_index(**kwargs):
-            calls.append(("segmented", kwargs))
-
-        def fake_create_partitioned_index(**kwargs):
-            calls.append(("partitioned", kwargs))
-
-        monkeypatch.setattr(lance_scalar_index, "_create_segmented_index", fake_create_segmented_index)
-        monkeypatch.setattr(lance_scalar_index, "_create_partitioned_index", fake_create_partitioned_index)
-
-        create_scalar_index_internal(
-            lance_ds=FakeLanceDataset(),
-            open_context=DatasetOpenContext(uri="memory://btree", version=1),
-            column="price",
-            index_type="BTREE",
-            name="price_btree_idx",
-            segmented=False,
-        )
-
-        assert [call[0] for call in calls] == ["lance_scalar"]
+    def test_unsupported_type_raises_instead_of_single_node_fallback(self) -> None:
+        """Types without a distributed path fail loudly; no silent fallback."""
+        with pytest.raises(ValueError, match="Unsupported distributed index type 'RTREE'"):
+            create_scalar_index_internal(
+                lance_ds=cast(Any, None),
+                open_context=cast(Any, None),
+                column="geom",
+                index_type="RTREE",
+            )
 
     def test_segmented_inverted_creates_index(self, multi_fragment_lance_dataset):
-        """Test that segmented=True with INVERTED creates an index."""
+        """INVERTED creates an index through the distributed segment workflow."""
         dataset_uri = multi_fragment_lance_dataset
 
         create_scalar_index(
@@ -1108,7 +1112,6 @@ class TestSegmentedBTreeIndex:
             column="text",
             index_type="INVERTED",
             name="text_inv_idx",
-            segmented=True,
         )
 
         updated_dataset = lance.dataset(dataset_uri)

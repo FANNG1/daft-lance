@@ -400,7 +400,7 @@ def create_scalar_index(
     column: str,
     index_type: str = "INVERTED",
     name: str | None = None,
-    replace: bool = False,
+    replace: bool = True,
     storage_options: dict[str, Any] | None = None,
     version: int | str | None = None,
     asof: str | None = None,
@@ -412,14 +412,13 @@ def create_scalar_index(
     fragment_group_size: int | None = None,
     num_partitions: int | None = None,
     max_concurrency: int | None = None,
-    segmented: bool = False,
     **kwargs: Any,
 ) -> None:
     """Build a distributed scalar index using Daft's distributed execution.
 
     This function distributes the index building process across multiple Daft workers,
-    with each worker building indices for a subset of fragments. The indices are then
-    merged and committed as a single index.
+    with each worker building independent index segments for a subset of fragments
+    that the coordinator commits atomically, recording complete index metadata.
 
     Args:
         uri: The URI of the Lance table (supports remote URLs to object stores such as `s3://` or `gs://`)
@@ -430,20 +429,17 @@ def create_scalar_index(
         namespace_properties: Properties for connecting to the namespace, e.g.
             {"root": "/data"} for "dir" or {"uri": "http://host:port"} for "rest".
         column: Column name to index
-        index_type: Type of index to build.
-            For distributed segmented execution this supports "BITMAP", "BTREE", "INVERTED", and "FTS".
-            Other scalar index types supported by Lance (for example "NGRAM", "ZONEMAP",
-            "LABEL_LIST", "BLOOMFILTER") are passed directly to
-            ``LanceDataset.create_scalar_index(...)``.
+        index_type: Type of index to build. Built distributed for
+            "BITMAP", "BTREE", "INVERTED", "FTS", "ZONEMAP", "NGRAM",
+            "LABEL_LIST", and "BLOOMFILTER". Other types raise ``ValueError``;
+            for those call pylance directly
+            (``lance.dataset(uri).create_scalar_index(...)``).
         name: Name of the index (generated if None).
-        replace: Whether to replace an existing index with the same name. Defaults to False.
-            This is only supported by scalar index types that are passed directly to
-            ``LanceDataset.create_scalar_index(...)``. Segmented BITMAP/BTREE/INVERTED/FTS
-            indexes use Lance's public segmented-index commit API, which does not
-            currently expose atomic replacement, so existing index names are rejected.
-            For BITMAP indexing with the default ``segmented=False`` behavior,
-            ``replace=True`` on an existing index falls back to Lance's scalar
-            replacement path to preserve existing API behavior.
+        replace: Whether to replace an existing index with the same name.
+            Defaults to True, matching pylance. Replacement is atomic: the
+            coordinator's segment commit retires the old index's overlapped
+            segments in the same transaction as the new ones. With
+            ``replace=False`` an existing index of the same name is rejected.
         storage_options: Storage options for the dataset.
         version: Version of the dataset to use.
         asof: Timestamp to use for time travel queries.
@@ -458,18 +454,14 @@ def create_scalar_index(
             greater than 1 enable additional parallelism on distributed runners; values <= 1 or None will use the default partitioning.
         max_concurrency: Maximum number of concurrent tasks to use for processing fragment batches.
             If None, Daft will use its default concurrency setting. Must be a positive integer.
-        segmented: If True, force the segmented index workflow where each worker builds
-            a fully independent index segment and the coordinator commits them via
-            ``commit_existing_index_segments``. ``"FTS"`` is normalized to Lance's
-            inverted full-text index. If False, scalar index creation uses the legacy
-            partitioned workflow or Lance's direct ``create_scalar_index`` path.
-        **kwargs: Additional keyword arguments forwarded to the selected Lance index creation API.
+        **kwargs: Additional keyword arguments forwarded to Lance's index segment creation API.
 
     Returns:
         None
 
     Raises:
-        ValueError: If input parameters are invalid (e.g., empty column name, non-existent column, invalid index type, etc.)
+        ValueError: If input parameters are invalid (e.g., empty column name, non-existent
+            column, unsupported index type, or an existing index name with ``replace=False``)
         TypeError: If column type is incompatible with the chosen ``index_type``
         RuntimeError: If index building fails (e.g., version compatibility issues, commit failures)
         ImportError: If lance package is not available
@@ -493,17 +485,16 @@ def create_scalar_index(
         ...     "s3://my-bucket/dataset/", column="price", index_type="BTREE", name="price_idx"
         ... )
 
-        Create a segmented BTREE index (supports describe_indices):
-        >>> daft_lance.create_scalar_index(
-        ...     "s3://my-bucket/dataset/", column="price", index_type="BTREE", segmented=True
-        ... )
+        Create a distributed ZONEMAP or NGRAM index (newly distributed):
+        >>> daft_lance.create_scalar_index("s3://my-bucket/dataset/", column="ts", index_type="ZONEMAP")
+        >>> daft_lance.create_scalar_index("s3://my-bucket/dataset/", column="doc", index_type="NGRAM")
 
         Create an index with custom fragment grouping and partitioning:
         >>> daft_lance.create_scalar_index(
         ...     "s3://my-bucket/dataset/", column="description", fragment_group_size=8, num_partitions=16
         ... )
 
-        Create an index without replacing existing ones:
+        Refuse to overwrite an existing index:
         >>> daft_lance.create_scalar_index("s3://my-bucket/dataset/", column="title", replace=False)
     """
     io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
@@ -534,7 +525,6 @@ def create_scalar_index(
         fragment_group_size=fragment_group_size,
         num_partitions=num_partitions,
         max_concurrency=max_concurrency,
-        segmented=segmented,
         **kwargs,
     )
 

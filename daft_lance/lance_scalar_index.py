@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import pickle
-import uuid
 from typing import TYPE_CHECKING, Any, cast
 
 import daft
@@ -18,54 +17,11 @@ from daft_lance.utils import distribute_fragments_balanced
 
 logger = logging.getLogger(__name__)
 
-# Segmented index types whose worker-built segments must be merged before commit.
-MERGED_SEGMENTED_INDEX_TYPES = {"BITMAP", "INVERTED"}
-
-
-class FragmentIndexHandler:
-    """Handler for distributed scalar index creation on fragment batches."""
-
-    def __init__(
-        self,
-        open_context: DatasetOpenContext,
-        column: str,
-        index_type: str,
-        name: str,
-        fragment_uuid: str,
-        replace: bool,
-        **kwargs: Any,
-    ) -> None:
-        self.open_context = open_context
-        self.column = column
-        self.index_type = index_type
-        self.name = name
-        self.fragment_uuid = fragment_uuid
-        self.replace = replace
-        self.kwargs = kwargs
-        self._lance_ds: lance.LanceDataset | None = None
-
-    def _dataset(self) -> lance.LanceDataset:
-        if self._lance_ds is None:
-            self._lance_ds = self.open_context.open_pinned()
-        return self._lance_ds
-
-    def __call__(self, fragment_ids: list[int]) -> bool:
-        """Process a batch of fragment IDs for scalar index creation."""
-        logger.info(
-            "Building distributed scalar index for fragments %s using create_scalar_index",
-            fragment_ids,
-        )
-
-        self._dataset().create_scalar_index(
-            column=self.column,
-            index_type=self.index_type,  # type: ignore[arg-type]
-            name=self.name,
-            replace=self.replace,
-            index_uuid=self.fragment_uuid,
-            fragment_ids=fragment_ids,
-            **self.kwargs,
-        )
-        return True
+# Scalar index types built with the distributed segment workflow. pylance 11
+# reports every scalar index type as segment-native; RTREE additionally
+# requires GeoArrow extension columns and stays unsupported until the test
+# suite can create those columns.
+DISTRIBUTED_INDEX_TYPES = frozenset({"BTREE", "BITMAP", "INVERTED", "ZONEMAP", "NGRAM", "LABEL_LIST", "BLOOMFILTER"})
 
 
 class SegmentedFragmentIndexHandler:
@@ -84,12 +40,14 @@ class SegmentedFragmentIndexHandler:
         column: str,
         index_type: str,
         name: str,
+        replace: bool = False,
         **kwargs: Any,
     ) -> None:
         self.open_context = open_context
         self.column = column
         self.index_type = index_type
         self.name = name
+        self.replace = replace
         self.kwargs = kwargs
         self._lance_ds: lance.LanceDataset | None = None
 
@@ -98,7 +56,7 @@ class SegmentedFragmentIndexHandler:
             self._lance_ds = self.open_context.open_pinned()
         return self._lance_ds
 
-    def __call__(self, fragment_ids: list[int], shard_id: int | None = None) -> bytes:
+    def __call__(self, fragment_ids: list[int]) -> bytes:
         """Build an independent index segment and return its pickled metadata."""
         logger.info(
             "Building segmented index segment for fragments %s (column=%s, type=%s)",
@@ -107,20 +65,22 @@ class SegmentedFragmentIndexHandler:
             self.index_type,
         )
         segment_kwargs = self.kwargs.copy()
-        if self.index_type == "BITMAP" and shard_id is not None:
-            # Lance's BITMAP segment builder needs a stable shard number to
-            # distinguish independently-built bitmap segments before merge/commit.
-            segment_kwargs["shard_id"] = shard_id
 
-        # Create one uncommitted index segment. ``pylance 8.0.0`` supports
-        # scalar index segments through this public API. Segment creation always
-        # uses ``replace=False`` because replacement, if supported, must happen
-        # in the final manifest commit rather than independently in each worker.
+        # Create one uncommitted index segment.  Segment creation normally
+        # uses ``replace=False`` because replacement must happen in the final
+        # manifest commit rather than independently in each worker.  The one
+        # exception is a replace=True rebuild: the worker's pinned snapshot
+        # still contains the same-named index (whether or not the driver
+        # dropped it), so Lance rejects building against that name with
+        # ``replace=False``.  The driver opts workers into ``replace=True``
+        # in exactly that case, and the coordinator's commit lands the new
+        # segments atomically — retiring overlapped old segments, or creating
+        # the index fresh on a post-drop manifest.
         index_meta = self._dataset().create_index_uncommitted(
             column=self.column,
             index_type=self.index_type,
             name=self.name,
-            replace=False,
+            replace=self.replace,
             train=True,
             fragment_ids=fragment_ids,
             **segment_kwargs,
@@ -149,11 +109,10 @@ def create_scalar_index_internal(
     column: str,
     index_type: str = "INVERTED",
     name: str | None = None,
-    replace: bool = False,
+    replace: bool = True,
     fragment_group_size: int | None = None,
     num_partitions: int | None = None,
     max_concurrency: int | None = None,
-    segmented: bool = False,
     **kwargs: Any,
 ) -> None:
     """Internal implementation of distributed scalar index creation.
@@ -162,15 +121,34 @@ def create_scalar_index_internal(
     ``open_context`` is the serializable handle workers reopen from and the
     single source of uri, storage options and namespace kwargs.
 
-    When ``segmented=True``, ``BITMAP``, ``BTREE``, and ``INVERTED`` use
-    Lance's public segment-index workflow: each worker builds a fully
-    independent index segment, and the coordinator commits them atomically with
-    ``commit_existing_index_segments``. ``FTS`` is normalized to ``INVERTED``
-    (same Lance index); see Lance Rust/Python bindings: ``INVERTED`` and
-    ``FTS`` map to the same inverted full-text index type.
+    Every supported index type is built with the distributed segment-index
+    workflow: each worker builds a fully independent index segment with
+    ``create_index_uncommitted``, and the coordinator commits them atomically
+    with ``commit_existing_index_segments``, which records complete index
+    metadata (no more empty ``index_details``). ``FTS`` is normalized to
+    ``INVERTED`` (same Lance index).
+
+    ``replace=True`` (the default) relies on Lance core's atomic overlap
+    replacement: ``commit_existing_index_segments`` removes committed segments
+    whose fragments overlap the incoming ones in the same CreateIndex
+    transaction, so a full-coverage rebuild swaps the old index in one
+    transaction. ``replace=False`` refuses to touch an existing index; the
+    default matches pylance's own ``replace`` default. Types without a distributed
+    path raise ``ValueError`` instead of silently falling back to single-node
+    Lance indexing — callers wanting single-node execution should call pylance
+    directly.
     """
     if not column:
         raise ValueError("Column name cannot be empty")
+
+    if "segmented" in kwargs:
+        # Removed parameter: **kwargs would otherwise forward it to Lance,
+        # which fails deep inside a worker with a confusing index-parameter
+        # error instead of at the API boundary.
+        raise TypeError(
+            "The 'segmented' parameter was removed: the distributed segment-index "
+            "workflow is now the only code path. Remove the argument."
+        )
 
     index_type = index_type.upper()
     if index_type == "FTS":
@@ -179,6 +157,13 @@ def create_scalar_index_internal(
         )
         index_type = "INVERTED"
 
+    if index_type not in DISTRIBUTED_INDEX_TYPES:
+        raise ValueError(
+            f"Unsupported distributed index type '{index_type}'. Supported types: "
+            f"{sorted(DISTRIBUTED_INDEX_TYPES)} (plus 'FTS'). For other types call pylance "
+            f"directly: lance.dataset(<uri>).create_scalar_index(...)."
+        )
+
     # Validate column exists and has correct type
     try:
         field = lance_ds.schema.field(column)
@@ -186,7 +171,8 @@ def create_scalar_index_internal(
         available_columns = [field.name for field in lance_ds.schema]
         raise ValueError(f"Column '{column}' not found. Available: {available_columns}") from e
 
-    # Check column type
+    # Check column type for the types with an obvious Python-side rule; the
+    # rest are validated by Lance during the distributed build.
     value_type = field.type
     if pa.types.is_list(field.type) or pa.types.is_large_list(field.type):
         value_type = field.type.value_type
@@ -202,70 +188,29 @@ def create_scalar_index_internal(
                 and not pa.types.is_string(value_type)
             ):
                 raise TypeError(f"Column {column} must be numeric or string type for BTREE index, got {value_type}")
-        case "BITMAP":
-            # BITMAP supports multiple physical Arrow types depending on the
-            # Lance release. Leave final type validation to Lance rather than
-            # duplicating a narrower Python-side allowlist here.
-            pass
         case _:
-            logger.warning(
-                "Distributed indexing currently only supports 'BITMAP', 'INVERTED', and 'BTREE' index types, not '%s'. So we are falling back to single-threaded index creation.",
-                index_type,
-            )
-            lance_ds.create_scalar_index(
-                column=column,
-                index_type=index_type,  # type: ignore[arg-type]
-                name=name,
-                replace=replace,
-                **kwargs,
-            )
-            return
-
-    if index_type == "BITMAP" and not segmented:
-        logger.info(
-            "Falling back to Lance scalar index creation for non-segmented BITMAP index %s.",
-            name,
-        )
-        lance_ds.create_scalar_index(
-            column=column,
-            index_type=index_type,
-            name=name,
-            replace=replace,
-            **kwargs,
-        )
-        return
+            pass
 
     # Generate index name if not provided
     if name is None:
         name = f"{column}_{index_type.lower()}_idx"
 
-    # Handle replace parameter - check for existing index with same name
-    if not replace or segmented:
-        existing_names = _existing_index_names(lance_ds)
-        if name in existing_names and segmented:
-            raise ValueError(
-                f"Index with name '{name}' already exists and cannot atomically replace existing index "
-                "with Lance's public segmented index API. Drop the existing index first or use a different name."
-            )
-        if name in existing_names:
+    # Replacement rides on Lance core's atomic overlap replacement:
+    # commit_existing_index_segments retires committed segments whose fragments
+    # overlap the incoming ones in the same CreateIndex transaction, so a
+    # full-coverage rebuild swaps the old index atomically. Segments that no
+    # longer overlap any live fragment cannot be retired this way, but normal
+    # operations never produce them (compaction rewrites coverage; delete
+    # retires fully-dead segments) and any that appear are healed by
+    # ``optimize_indices``.
+    handler_replace = False
+    if name in _existing_index_names(lance_ds):
+        if not replace:
             raise ValueError(f"Index with name '{name}' already exists. Set replace=True to replace it.")
+        # Workers open the pinned snapshot where the same-name index still
+        # exists; building against that name requires replace=True.
+        handler_replace = True
 
-    if index_type == "BTREE" and not segmented:
-        logger.info(
-            "Falling back to Lance scalar index creation for non-segmented %s index %s.",
-            index_type,
-            name,
-        )
-        lance_ds.create_scalar_index(
-            column=column,
-            index_type=index_type,
-            name=name,
-            replace=replace,
-            **kwargs,
-        )
-        return
-
-    # Get available fragment IDs to use
     fragments = lance_ds.get_fragments()
     fragment_ids_to_use = [fragment.fragment_id for fragment in fragments]
 
@@ -291,43 +236,26 @@ def create_scalar_index_internal(
         return
 
     logger.info(
-        "Starting distributed scalar index creation: column=%s, type=%s, name=%s, fragment_group_size=%s, max_concurrency=%s, segmented=%s",
+        "Starting distributed scalar index creation: column=%s, type=%s, name=%s, fragment_group_size=%s, max_concurrency=%s",
         column,
         index_type,
         name,
         fragment_group_size,
         max_concurrency,
-        segmented,
     )
 
-    # Use segment-index creation for Lance scalar index types that expose the
-    # public uncommitted segment API.  The legacy path is kept as a fallback for
-    # older/unsupported distributed scalar index types.
-    if segmented:
-        _create_segmented_index(
-            open_context=open_context,
-            column=column,
-            index_type=index_type,
-            name=name,
-            fragment_data=fragment_data,
-            fragment_ids_to_use=fragment_ids_to_use,
-            num_partitions=num_partitions,
-            max_concurrency=max_concurrency,
-            **kwargs,
-        )
-    else:
-        _create_partitioned_index(
-            open_context=open_context,
-            column=column,
-            index_type=index_type,
-            name=name,
-            replace=replace,
-            fragment_data=fragment_data,
-            fragment_ids_to_use=fragment_ids_to_use,
-            num_partitions=num_partitions,
-            max_concurrency=max_concurrency,
-            **kwargs,
-        )
+    _create_segmented_index(
+        open_context=open_context,
+        column=column,
+        index_type=index_type,
+        name=name,
+        fragment_data=fragment_data,
+        fragment_ids_to_use=fragment_ids_to_use,
+        num_partitions=num_partitions,
+        max_concurrency=max_concurrency,
+        handler_replace=handler_replace,
+        **kwargs,
+    )
 
 
 def _create_segmented_index(
@@ -340,6 +268,7 @@ def _create_segmented_index(
     fragment_ids_to_use: list[int],
     num_partitions: int | None,
     max_concurrency: int | None,
+    handler_replace: bool = False,
     **kwargs: Any,
 ) -> None:
     """Segmented index workflow: each worker builds an independent segment.
@@ -347,7 +276,15 @@ def _create_segmented_index(
     Workers call Lance's uncommitted index segment API, pickle the returned
     ``lance.Index`` metadata so it can traverse Daft serialisation boundaries,
     and return it.  The coordinator unpickles all segments and commits them
-    atomically via ``commit_existing_index_segments``.
+    as-is via ``commit_existing_index_segments``: committed segments whose
+    fragments overlap the incoming ones are retired in the same transaction
+    (atomic replacement), and non-overlapping ones are appended.  Multi-segment
+    indexes are fully functional without merging (verified: split segments are
+    loaded and pruned at query time with identical scores), so no merge is
+    performed; compaction is left to ``optimize_indices``.  When
+    ``handler_replace`` is set the workers' pinned snapshot still contains a
+    same-named index; they must build with ``replace=True`` for Lance to
+    accept the name.
     """
     handler_cls = daft.cls(
         SegmentedFragmentIndexHandler,
@@ -358,34 +295,17 @@ def _create_segmented_index(
         column=column,
         index_type=index_type,
         name=name,
+        replace=handler_replace,
         **kwargs,
     )
 
-    segment_data: list[dict[str, Any]]
-    if index_type == "BITMAP":
-        # Give each worker-built BITMAP segment a stable Lance shard id.  This
-        # is separate from Lance fragment ids: shard_id identifies the bitmap
-        # segment, while fragment_ids identify the rows covered by that segment.
-        segment_data = [
-            {
-                **group,
-                "shard_id": shard_id,
-            }
-            for shard_id, group in enumerate(fragment_data)
-        ]
-    else:
-        segment_data = fragment_data
-
     with execution_config_ctx(maintain_order=False):
         if num_partitions is not None and num_partitions > 1:
-            df = from_pylist(segment_data).repartition(num_partitions)
+            df = from_pylist(fragment_data).repartition(num_partitions)
         else:
-            df = from_pylist(segment_data)
+            df = from_pylist(fragment_data)
 
-        if index_type == "BITMAP":
-            df = df.select(handler(df["fragment_ids"], df["shard_id"]).alias("index_meta"))
-        else:
-            df = df.select(handler(df["fragment_ids"]).alias("index_meta"))
+        df = df.select(handler(df["fragment_ids"]).alias("index_meta"))
         collected = df.collect()
 
     # Deserialise the Index metadata returned by each worker.
@@ -396,7 +316,6 @@ def _create_segmented_index(
     # Reload dataset to pick up the latest version (segment files were written
     # by workers against the version that was current at their invocation time).
     lance_ds = open_context.open_latest()
-    index_metas = _prepare_index_segments_for_commit(lance_ds, index_type, index_metas)
 
     logger.info(
         "Collected %d index segments; committing as segmented index %s",
@@ -406,114 +325,3 @@ def _create_segmented_index(
     lance_ds.commit_existing_index_segments(name, column, index_metas)
 
     logger.info("Segmented index %s committed successfully", name)
-
-
-def _prepare_index_segments_for_commit(
-    lance_ds: lance.LanceDataset,
-    index_type: str,
-    index_metas: list[lance.Index | lance.indices.IndexSegment],
-) -> list[lance.Index | lance.indices.IndexSegment]:
-    """Prepare worker-built segments for the final manifest commit."""
-    if index_type not in MERGED_SEGMENTED_INDEX_TYPES or len(index_metas) <= 1:
-        return index_metas
-
-    merged = lance_ds.merge_existing_index_segments([cast(lance.Index, segment) for segment in index_metas])
-    return [merged]
-
-
-def _create_partitioned_index(
-    open_context: DatasetOpenContext,
-    *,
-    column: str,
-    index_type: str,
-    name: str,
-    replace: bool,
-    fragment_data: list[dict[str, list[int]]],
-    fragment_ids_to_use: list[int],
-    num_partitions: int | None,
-    max_concurrency: int | None,
-    **kwargs: Any,
-) -> None:
-    """Legacy partitioned-and-merged index workflow.
-
-    Workers build partial index files sharing the same UUID, then the
-    coordinator merges them with ``merge_index_metadata`` and commits via a
-    manual ``CreateIndex`` transaction.
-    """
-    # Generate unique index ID (shared across all partitions)
-    index_id = str(uuid.uuid4())
-
-    handler_cls = daft.cls(
-        FragmentIndexHandler,
-        max_concurrency=max_concurrency,
-    )
-    handler = handler_cls(
-        open_context=open_context,
-        column=column,
-        index_type=index_type,
-        name=name,
-        fragment_uuid=index_id,
-        replace=replace,
-        **kwargs,
-    )
-
-    with execution_config_ctx(maintain_order=False):
-        if num_partitions is not None and num_partitions > 1:
-            df = from_pylist(fragment_data).repartition(num_partitions)
-        else:
-            df = from_pylist(fragment_data)
-
-        df = df.select(handler(df["fragment_ids"]))
-        df.collect()
-
-    logger.info("Starting index metadata merging by reloading dataset to get latest state")
-    lance_ds = open_context.open_latest()
-    lance_ds.merge_index_metadata(index_id, index_type)
-
-    logger.info("Starting atomic index creation and commit")
-    field_id = lance_ds.schema.get_field_index(column)
-    index = lance.Index(
-        uuid=index_id,
-        name=name,
-        fields=[field_id],
-        dataset_version=lance_ds.version,
-        fragment_ids=set(fragment_ids_to_use),
-        index_version=0,
-    )
-    removed_indices = []
-    if replace:
-        # NOTE: kept on list_indices() until the distributed-index commit path is
-        # rewritten to populate index_details (e.g. via commit_existing_index_segments).
-        # describe_indices() raises on indices produced by this flow because their
-        # index_details field is empty.
-        for idx_info_raw in lance_ds.list_indices():
-            idx_info = cast(dict[str, Any], idx_info_raw)
-            if idx_info["name"] == name:
-                field_ids = [lance_ds.schema.get_field_index(f) for f in idx_info["fields"]]
-                removed_indices.append(
-                    lance.Index(
-                        uuid=idx_info["uuid"],
-                        name=idx_info["name"],
-                        fields=field_ids,
-                        dataset_version=lance_ds.version,
-                        fragment_ids=idx_info["fragment_ids"],
-                        index_version=idx_info["version"],
-                        base_id=idx_info.get("base_id"),
-                    )
-                )
-
-    create_index_op = lance.LanceOperation.CreateIndex(
-        new_indices=[index],
-        removed_indices=removed_indices,
-    )
-
-    # Commit the index operation atomically
-    lance.LanceDataset.commit(
-        open_context.uri,
-        create_index_op,
-        read_version=lance_ds.version,
-        storage_options=open_context.storage_options,
-        **open_context.commit_kwargs,
-    )
-
-    logger.info("Index %s created successfully with ID %s", name, index_id)

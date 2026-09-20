@@ -248,10 +248,9 @@ def test_namespace_create_scalar_index(tmp_path: Path) -> None:
     assert any(idx["fields"] == ["price"] for idx in indices)
 
 
-@pytest.mark.parametrize("segmented", [False, True])
-def test_namespace_create_distributed_inverted_index(tmp_path: Path, segmented: bool) -> None:
+def test_namespace_create_distributed_inverted_index(tmp_path: Path) -> None:
     ns = _dir_ns(tmp_path)
-    table_id = [f"inverted_{segmented}"]
+    table_id = ["inverted_dist"]
 
     daft_lance.write_lance(
         daft.from_pydict({"id": list(range(20)), "text": [f"document {i}" for i in range(20)]}),
@@ -265,7 +264,6 @@ def test_namespace_create_distributed_inverted_index(tmp_path: Path, segmented: 
         column="text",
         index_type="INVERTED",
         name="text_idx",
-        segmented=segmented,
         **ns,
     )
 
@@ -799,16 +797,12 @@ def test_maintenance_udfs_hold_a_context_not_a_dataset(tmp_path: Path) -> None:
         FragmentHandler,
         GroupFragmentMergeUDF,
     )
-    from daft_lance.lance_scalar_index import (
-        FragmentIndexHandler,
-        SegmentedFragmentIndexHandler,
-    )
+    from daft_lance.lance_scalar_index import SegmentedFragmentIndexHandler
 
     context = _ns_handle(tmp_path, "udf_tbl").worker_open_context()
 
     plain = [
         CompactionTaskUDF(context),
-        FragmentIndexHandler(context, "score", "BTREE", "idx", "uuid", False),
         SegmentedFragmentIndexHandler(context, "score", "BTREE", "idx"),
     ]
     # daft.cls wraps these, so reach through to the instance it actually holds.
