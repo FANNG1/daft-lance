@@ -31,7 +31,12 @@ _FRAGMENT_UPDATE_RESULT_DTYPE = DataType.struct(
 
 @dataclass(frozen=True)
 class UpdateColumnsResult:
-    """Result of a distributed Lance column update."""
+    """Result of a distributed Lance column update.
+
+    ``rows_updated`` counts the rows the source submitted, not the rows Lance
+    matched. They differ when the source carries a ``_rowaddr`` that is not a
+    live row of the pinned snapshot, which is silently ignored.
+    """
 
     version: int
     rows_updated: int
@@ -143,58 +148,21 @@ def _prepare_fragment_update(columns: list[str], series: tuple[Any, ...]) -> _Fr
     return _FragmentUpdateBatch(fragment_id, row_addresses, values)
 
 
-def _validate_live_row_addresses(
-    fragment: Any,
-    row_addresses: pa.Array[Any],
-    *,
-    fragment_id: int,
-    version: int,
-) -> None:
-    """Require every requested address to identify a live row in the pinned fragment."""
-    metadata = fragment.metadata
-    if metadata.deletion_file is None and metadata.physical_rows is not None:
-        # Without a deletion vector every offset below physical_rows is live, so
-        # the live addresses are exactly one contiguous range and no row scan is
-        # needed to check membership.
-        first = fragment_id << 32
-        addresses_are_live = pa.compute.and_(
-            pa.compute.greater_equal(row_addresses, pa.scalar(first, type=pa.uint64())),
-            pa.compute.less(row_addresses, pa.scalar(first + metadata.physical_rows, type=pa.uint64())),
-        )
-    else:
-        live_row_addresses = (
-            fragment.scanner(columns=[], with_row_address=True).to_table().column(_ROW_ADDRESS).combine_chunks()
-        )
-        addresses_are_live = pa.compute.is_in(row_addresses, value_set=live_row_addresses)
-    if bool(pa.compute.all(addresses_are_live).as_py()):
-        return
-
-    invalid = row_addresses.filter(pa.compute.invert(addresses_are_live)).to_pylist()
-    preview = invalid[:10]
-    suffix = "..." if len(invalid) > len(preview) else ""
-    raise ValueError(
-        f"Source contains _rowaddr values that are not live rows in fragment {fragment_id} "
-        f"at version {version}: {preview}{suffix}"
-    )
-
-
 def _rewrite_fragment(
     lance_ds: lance.LanceDataset,
     batch: _FragmentUpdateBatch,
     *,
     columns: list[str],
 ) -> dict[str, Any]:
-    """Validate and rewrite one fragment, returning a minimal driver commit message."""
+    """Rewrite one fragment, returning a minimal driver commit message.
+
+    Row addresses are not checked against the fragment. ``update_columns`` is a
+    left-outer join, so an address that does not identify a live row of this
+    fragment updates nothing and raises nothing.
+    """
     fragment = lance_ds.get_fragment(batch.fragment_id)
     if fragment is None:
         raise ValueError(f"Fragment {batch.fragment_id} does not exist in target snapshot version {lance_ds.version}.")
-
-    _validate_live_row_addresses(
-        fragment,
-        batch.row_addresses,
-        fragment_id=batch.fragment_id,
-        version=lance_ds.version,
-    )
 
     target_schema = pa.schema([lance_ds.schema.field(name) for name in columns])
     for field in target_schema:

@@ -160,29 +160,13 @@ def test_update_columns_df_empty_is_noop(tmp_path: Path) -> None:
     assert lance.dataset(path).version == version
 
 
-@pytest.mark.parametrize(
-    ("source_data", "message"),
-    [
-        (
-            {"_rowaddr": [999], "fragment_id": [0], "value": [100]},
-            "not live rows",
-        ),
-        (
-            {"_rowaddr": [0, 0], "fragment_id": [0, 0], "value": [100, 200]},
-            "Duplicate _rowaddr",
-        ),
-    ],
-)
-def test_update_columns_df_rejects_invalid_addresses(
-    tmp_path: Path,
-    source_data: dict[str, list[Any]],
-    message: str,
-) -> None:
+def test_update_columns_df_rejects_duplicate_addresses(tmp_path: Path) -> None:
     path = str(tmp_path / "invalid-address.lance")
     daft.from_pydict({"id": [1, 2], "value": [10, 20]}).write_lance(path)
     version = lance.dataset(path).version
+    source_data = {"_rowaddr": [0, 0], "fragment_id": [0, 0], "value": [100, 200]}
 
-    with pytest.raises(Exception, match=message):
+    with pytest.raises(Exception, match="Duplicate _rowaddr"):
         daft_lance.update_columns_df(
             daft.from_pydict(cast(Any, source_data)),
             path,
@@ -190,6 +174,24 @@ def test_update_columns_df_rejects_invalid_addresses(
         )
 
     assert lance.dataset(path).version == version
+
+
+def test_update_columns_df_ignores_out_of_range_address(tmp_path: Path) -> None:
+    """An address past the end of the fragment matches nothing and is dropped."""
+    path = str(tmp_path / "out-of-range.lance")
+    daft.from_pydict({"id": [1, 2], "value": [10, 20]}).write_lance(path)
+    version = lance.dataset(path).version
+    source_data = {"_rowaddr": [0, 999], "fragment_id": [0, 0], "value": [100, 200]}
+
+    result = daft_lance.update_columns_df(
+        daft.from_pydict(cast(Any, source_data)),
+        path,
+        columns=["value"],
+    )
+
+    # rows_updated counts what the source submitted, not what Lance matched.
+    assert result == daft_lance.UpdateColumnsResult(version=version + 1, rows_updated=2)
+    assert lance.dataset(path).to_table().sort_by("id").to_pydict() == {"id": [1, 2], "value": [100, 20]}
 
 
 @pytest.mark.parametrize(
@@ -297,20 +299,22 @@ def test_update_columns_df_uses_commit_lock(tmp_path: Path) -> None:
     assert lance.dataset(path).to_table().column("value").to_pylist() == [20]
 
 
-def test_update_columns_df_rejects_deleted_row_address(tmp_path: Path) -> None:
+def test_update_columns_df_ignores_deleted_row_address(tmp_path: Path) -> None:
+    """A stale address for a row deleted before the pinned snapshot is dropped."""
     path = str(tmp_path / "deleted-row-address.lance")
     daft.from_pydict({"id": [1, 2], "value": [10, 20]}).write_lance(path)
     stale_source = _read_update_source(path).where("id = 2").with_column("value", daft.lit(200))
     lance.dataset(path).delete("id = 2")
     version_after_delete = lance.dataset(path).version
 
-    with pytest.raises(Exception, match="not live rows"):
-        daft_lance.update_columns_df(stale_source, path, columns=["value"])
+    result = daft_lance.update_columns_df(stale_source, path, columns=["value"])
 
-    assert lance.dataset(path).version == version_after_delete
+    assert result == daft_lance.UpdateColumnsResult(version=version_after_delete + 1, rows_updated=1)
+    assert lance.dataset(path).to_table().to_pydict() == {"id": [1], "value": [10]}
 
 
-def test_update_columns_df_rejects_address_from_another_fragment(tmp_path: Path) -> None:
+def test_update_columns_df_ignores_address_from_another_fragment(tmp_path: Path) -> None:
+    """An address whose high bits name a different fragment matches nothing."""
     path = str(tmp_path / "cross-fragment-address.lance")
     daft.from_pydict({"id": [1, 2], "value": [10, 20]}).write_lance(path, max_rows_per_file=1)
     version = lance.dataset(path).version
@@ -318,7 +322,7 @@ def test_update_columns_df_rejects_address_from_another_fragment(tmp_path: Path)
     assert addresses["fragment_id"] == [0, 1]
 
     # Fragment 0's address routed to fragment 1's worker: the high 32 bits do not
-    # match the fragment being rewritten.
+    # match the fragment being rewritten, so the join drops it.
     source = daft.from_pydict(
         {
             "_rowaddr": [addresses["_rowaddr"][0]],
@@ -327,10 +331,10 @@ def test_update_columns_df_rejects_address_from_another_fragment(tmp_path: Path)
         }
     )
 
-    with pytest.raises(Exception, match="not live rows in fragment 1"):
-        daft_lance.update_columns_df(source, path, columns=["value"])
+    result = daft_lance.update_columns_df(source, path, columns=["value"])
 
-    assert lance.dataset(path).version == version
+    assert result == daft_lance.UpdateColumnsResult(version=version + 1, rows_updated=1)
+    assert lance.dataset(path).to_table().sort_by("id").to_pydict() == {"id": [1, 2], "value": [10, 20]}
 
 
 def test_update_columns_df_rejects_null_for_non_nullable_target(tmp_path: Path) -> None:

@@ -92,17 +92,24 @@ Struct columns are not supported: a source struct that omits one of the
 target's fields casts cleanly with that field set to null, which would silently
 drop data the caller never meant to overwrite.
 
-The source `_rowaddr` values must all be unique live rows in the pinned target
-snapshot. The update is committed atomically using Lance `RewriteColumns`.
+The source `_rowaddr` values must be unique, and they must identify live rows
+of the pinned target snapshot. Uniqueness is enforced; liveness is not. The
+rewrite is a left-outer join on `_rowaddr`, so an address that matches no live
+row updates nothing and raises nothing — it is still counted in
+`rows_updated`. Read the source from the snapshot you are updating (pass the
+same `version` if you pin one) rather than replaying an address list produced
+against an older snapshot. The update itself is committed atomically using
+Lance `RewriteColumns`.
+
 Stable-row-ID datasets are rejected before any fragments are written because
 current pylance bindings cannot propagate the offsets required to advance
 `_row_last_updated_at_version` and keep CDF metadata correct.
 
-Fragments are rewritten in parallel, so an invalid `_rowaddr` (or any other
-per-fragment failure) can surface after other fragments have already written
-their new column files. Nothing is committed and the dataset version does not
-move, but those unreferenced files stay on storage until Lance cleans them up
-via `LanceDataset.cleanup_old_versions`.
+Fragments are rewritten in parallel, so a per-fragment failure can surface
+after other fragments have already written their new column files. Nothing is
+committed and the dataset version does not move, but those unreferenced files
+stay on storage until Lance cleans them up via
+`LanceDataset.cleanup_old_versions`.
 
 ### Namespace Tables
 

@@ -448,13 +448,18 @@ def update_columns_df(
         max_concurrency: Maximum number of concurrent fragment-update workers.
 
     Returns:
-        The committed dataset version and exact number of updated live rows.
+        The committed dataset version, and the number of rows the source
+        submitted. Row addresses are not checked against the target: the
+        rewrite is a left-outer join, so a ``_rowaddr`` that is not a live row
+        of the pinned snapshot updates nothing, raises nothing, and is still
+        counted. Keep the source aligned with ``version`` to keep the count
+        meaningful.
 
     Note:
-        Fragments are validated and rewritten in parallel, so a failure raised
-        by one fragment can leave data files other fragments already wrote
-        behind. Nothing is committed and the dataset version does not change;
-        the unreferenced files stay until Lance cleans them up (see
+        Fragments are rewritten in parallel, so a failure raised by one
+        fragment can leave data files other fragments already wrote behind.
+        Nothing is committed and the dataset version does not change; the
+        unreferenced files stay until Lance cleans them up (see
         ``LanceDataset.cleanup_old_versions``).
 
     Raises:
