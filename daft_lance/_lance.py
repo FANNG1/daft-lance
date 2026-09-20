@@ -412,6 +412,7 @@ def create_scalar_index(
     fragment_group_size: int | None = None,
     num_partitions: int | None = None,
     max_concurrency: int | None = None,
+    fragment_ids: list[int] | None = None,
     **kwargs: Any,
 ) -> None:
     """Build a distributed scalar index using Daft's distributed execution.
@@ -438,8 +439,12 @@ def create_scalar_index(
         replace: Whether to replace an existing index with the same name.
             Defaults to True, matching pylance. Replacement is atomic: the
             coordinator's segment commit retires the old index's overlapped
-            segments in the same transaction as the new ones. With
-            ``replace=False`` an existing index of the same name is rejected.
+            segments in the same transaction as the new ones (the index type
+            may change on a full rebuild). With ``replace=False``
+            an existing index of the same name is rejected — except when
+            ``fragment_ids`` is given, which appends coverage for the
+            requested fragments (backfill) and never replaces existing
+            segments, so the ``replace`` flag does not apply.
         storage_options: Storage options for the dataset.
         version: Version of the dataset to use.
         asof: Timestamp to use for time travel queries.
@@ -454,6 +459,17 @@ def create_scalar_index(
             greater than 1 enable additional parallelism on distributed runners; values <= 1 or None will use the default partitioning.
         max_concurrency: Maximum number of concurrent tasks to use for processing fragment batches.
             If None, Daft will use its default concurrency setting. Must be a positive integer.
+        fragment_ids: Optional subset of fragment IDs to index. Only the listed
+            fragments are scheduled; fragments already covered by an existing
+            same-name, same-column, same-type index are skipped and the
+            remaining ones are appended as new segments, preserving committed
+            segments untouched (``replace`` does not apply to this append
+            path, and a fully covered request is a no-op that leaves the
+            dataset version unchanged — pass ``replace=True`` without
+            ``fragment_ids`` to rebuild instead). Same-name indexes must keep
+            their column and, on backfill, their index type — Lance's build
+            and commit APIs reject mismatches. Duplicates are ignored; unknown
+            IDs and an empty list raise ``ValueError``.
         **kwargs: Additional keyword arguments forwarded to Lance's index segment creation API.
 
     Returns:
@@ -496,6 +512,10 @@ def create_scalar_index(
 
         Refuse to overwrite an existing index:
         >>> daft_lance.create_scalar_index("s3://my-bucket/dataset/", column="title", replace=False)
+
+        Index only half the fragments now and backfill the rest later:
+        >>> daft_lance.create_scalar_index("s3://my-bucket/dataset/", column="title", fragment_ids=[0, 1])
+        >>> daft_lance.create_scalar_index("s3://my-bucket/dataset/", column="title", fragment_ids=[2, 3])
     """
     io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
 
@@ -525,6 +545,7 @@ def create_scalar_index(
         fragment_group_size=fragment_group_size,
         num_partitions=num_partitions,
         max_concurrency=max_concurrency,
+        fragment_ids=fragment_ids,
         **kwargs,
     )
 

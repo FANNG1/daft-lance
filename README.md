@@ -36,12 +36,42 @@ create_scalar_index("s3://bucket/my_dataset", column="name", index_type="INVERTE
 create_scalar_index("s3://bucket/my_dataset", column="ts", index_type="ZONEMAP")
 ```
 
+Types without a distributed path (e.g. `RTREE`) raise `ValueError` — call
+pylance directly (`lance.dataset(uri).create_scalar_index(...)`) for
+single-node indexing.
+
 `replace=True` (the default) atomically swaps an existing index of the same
 name: the segment commit retires the old overlapped segments in the same
-transaction as the new ones. `replace=False` rejects an existing name. Types
-without a distributed path (e.g. `RTREE`) raise `ValueError` — call pylance
-directly (`lance.dataset(uri).create_scalar_index(...)`) for single-node
-indexing.
+transaction as the new ones (the index type may change on a full rebuild;
+the column may not — drop the index or use a different name for that).
+`replace=False` rejects an existing name.
+
+#### Partial Builds and Incremental Backfill
+
+Pass `fragment_ids` to index only a subset of fragments today and backfill
+the rest later. Fragments already covered by the existing same-name index
+are skipped, and committed segments for other fragments are preserved
+untouched:
+
+```python
+# Index the first two fragments now.
+create_scalar_index("s3://bucket/my_dataset", column="name", index_type="INVERTED", fragment_ids=[0, 1])
+
+# After appending data, backfill only the new fragments.
+create_scalar_index("s3://bucket/my_dataset", column="name", index_type="INVERTED", fragment_ids=[2, 3])
+```
+
+Unknown fragment IDs and an empty list raise `ValueError`; duplicate IDs are
+ignored. Indexing an empty dataset raises `ValueError` (no silent no-op), and
+generated index names follow pylance's convention (`<column>_idx`); before
+committing, the driver validates that the built segments cover every
+scheduled fragment exactly once and reference no fragments that a concurrent
+compaction removed. A same-name index keeps its column and, on backfill, its
+index type — mismatches are rejected by Lance's build/commit APIs. Backfill appends and never replaces existing segments, so
+`replace=False` does not apply to it; a fully covered request is a no-op
+that leaves the dataset version unchanged (rebuild with `replace=True` and
+no `fragment_ids` instead).
+
 
 > **Breaking change (from 0.5.0):** the `segmented` parameter was removed —
 > the distributed segment-index workflow is now the only code path, and the

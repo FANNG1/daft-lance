@@ -50,7 +50,7 @@ def test_new_type_builds_distributed_with_full_metadata(
     described = lance.dataset(uri).describe_indices()
     assert len(described) == 1
     desc = described[0]
-    assert desc.name == f"{column}_{index_type.lower()}_idx"
+    assert desc.name == f"{column}_idx"
     # The whole point of the segment workflow: metadata must be complete, not "Unknown".
     assert desc.index_type == expected_type
     assert desc.type_url != ""

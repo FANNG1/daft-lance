@@ -137,7 +137,7 @@ class TestDistributedIndexing:
         # populate Lance index details, so use list_indices() here.
         indices = updated_dataset.list_indices()
         index_names = [idx["name"] for idx in indices]
-        assert "text_inverted_idx" in index_names, f"Text index not found in {index_names}"
+        assert "text_idx" in index_names, f"Text index not found in {index_names}"
 
         # Test full-text search functionality
         search_term = "Python"
@@ -546,17 +546,13 @@ class TestDistributedIndexing:
         path = Path(temp_dir) / "empty_dataset.lance"
         dataset.write_lance(uri=path)
 
-        # Try to build index on empty dataset
-        create_scalar_index(
-            uri=path,
-            column="text",
-            index_type="INVERTED",
-        )
-
-        # Verify no index was created (since no data)
-        updated_dataset = lance.dataset(path)
-        indices = updated_dataset.list_indices()
-        assert len(indices) == 0, f"Expected no indices for empty dataset, got {len(indices)}"
+        # Building an index on an empty dataset fails loudly (no silent no-op).
+        with pytest.raises(ValueError, match="contains no fragments"):
+            create_scalar_index(
+                uri=path,
+                column="text",
+                index_type="INVERTED",
+            )
 
     def test_build_distributed_index_zonemap_type(self, temp_dir):
         """Test building ZONEMAP index distributed on a numeric column."""
@@ -781,6 +777,8 @@ class TestSegmentedBTreeIndex:
 
         class ExistingIndex:
             name = "flag_bitmap_idx"
+            index_type = "Bitmap"
+            field_names = ["flag"]
             segments = [FakeSegment({0, 1})]
 
         class FakeFragment:

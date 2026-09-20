@@ -102,6 +102,39 @@ def _existing_index_names(lance_ds: lance.LanceDataset) -> set[str]:
         return set()
 
 
+def _existing_index_coverage(lance_ds: lance.LanceDataset, name: str) -> set[int] | None:
+    """Return the fragment IDs covered by an existing index, or None if absent.
+
+    The coverage is the union of the fragment IDs covered by the index's
+    committed segments. Returns ``None`` when no index with that name exists.
+    When the manifest cannot be described but the name is visible through the
+    deprecated ``list_indices``, returns an empty set so callers still treat
+    the index as existing. Column/type compatibility is not checked here:
+    Lance's build and commit APIs reject incompatible combinations, and
+    duplicating those rules in string space has caused false rejections
+    before (e.g. 'LabelList' vs 'LABEL_LIST').
+    """
+    try:
+        descriptions = lance_ds.describe_indices()
+    except Exception:
+        logger.warning("describe_indices() failed; checking '%s' via list_indices", name, exc_info=True)
+        try:
+            if any(cast(dict[str, Any], idx).get("name") == name for idx in lance_ds.list_indices()):
+                return set()
+        except Exception:
+            pass
+        return None
+
+    for desc in descriptions:
+        if desc.name != name:
+            continue
+        covered: set[int] = set()
+        for segment in desc.segments or []:
+            covered.update(segment.fragment_ids or ())
+        return covered
+    return None
+
+
 def create_scalar_index_internal(
     lance_ds: lance.LanceDataset,
     open_context: DatasetOpenContext,
@@ -113,6 +146,7 @@ def create_scalar_index_internal(
     fragment_group_size: int | None = None,
     num_partitions: int | None = None,
     max_concurrency: int | None = None,
+    fragment_ids: list[int] | None = None,
     **kwargs: Any,
 ) -> None:
     """Internal implementation of distributed scalar index creation.
@@ -137,6 +171,13 @@ def create_scalar_index_internal(
     path raise ``ValueError`` instead of silently falling back to single-node
     Lance indexing — callers wanting single-node execution should call pylance
     directly.
+
+    ``fragment_ids`` restricts the build to a subset of the dataset's
+    fragments. When the named index already exists, already-covered fragments
+    are skipped and only the remaining ones are built and appended; untouched
+    committed segments are preserved. This is the incremental backfill path
+    for newly appended fragments. Column/type compatibility of a same-name
+    index is validated by Lance's build/commit APIs, not duplicated here.
     """
     if not column:
         raise ValueError("Column name cannot be empty")
@@ -191,9 +232,40 @@ def create_scalar_index_internal(
         case _:
             pass
 
-    # Generate index name if not provided
+    # Generate index name if not provided (matches pylance's convention)
     if name is None:
-        name = f"{column}_{index_type.lower()}_idx"
+        name = f"{column}_idx"
+
+    fragments = lance_ds.get_fragments()
+    available_fragment_ids = {fragment.fragment_id for fragment in fragments}
+
+    # Validate and normalize the requested fragment subset, if any.
+    requested_fragment_ids: set[int] | None = None
+    if fragment_ids is not None:
+        if len(fragment_ids) == 0:
+            raise ValueError("fragment_ids must be a non-empty list of fragment IDs; pass None to index all fragments.")
+        unique_ids = list(dict.fromkeys(fragment_ids))
+        duplicates = sorted({fid for fid in unique_ids if fragment_ids.count(fid) > 1})
+        if duplicates:
+            logger.warning("Duplicate fragment_ids %s were given; each fragment is scheduled once.", duplicates)
+        unknown_ids = sorted(fid for fid in unique_ids if fid not in available_fragment_ids)
+        if unknown_ids:
+            raise ValueError(
+                f"fragment_ids {unknown_ids} do not exist in the dataset. "
+                f"Available fragment IDs: {sorted(available_fragment_ids)}"
+            )
+        requested_fragment_ids = set(unique_ids)
+
+    existing_coverage = _existing_index_coverage(lance_ds, name)
+    if existing_coverage is not None:
+        # Column/type compatibility of a same-name index is validated by
+        # Lance itself: the build API rejects a different column ("already
+        # exists with different fields") and the commit API rejects appending
+        # segments of a different type. Duplicating those rules here would be
+        # a string-space copy that can drift from the real type system (it
+        # already caused false rejections once), so no pre-check is kept.
+        if not replace and requested_fragment_ids is None:
+            raise ValueError(f"Index with name '{name}' already exists. Set replace=True to replace it.")
 
     # Replacement rides on Lance core's atomic overlap replacement:
     # commit_existing_index_segments retires committed segments whose fragments
@@ -202,17 +274,33 @@ def create_scalar_index_internal(
     # longer overlap any live fragment cannot be retired this way, but normal
     # operations never produce them (compaction rewrites coverage; delete
     # retires fully-dead segments) and any that appear are healed by
-    # ``optimize_indices``.
-    handler_replace = False
-    if name in _existing_index_names(lance_ds):
-        if not replace:
-            raise ValueError(f"Index with name '{name}' already exists. Set replace=True to replace it.")
-        # Workers open the pinned snapshot where the same-name index still
-        # exists; building against that name requires replace=True.
-        handler_replace = True
+    # ``optimize_indices``. Workers open the pinned snapshot where a
+    # same-name index still exists; building against that name always
+    # requires replace=True.
+    handler_replace = existing_coverage is not None
+    if existing_coverage is not None and requested_fragment_ids is not None:
+        # Incremental backfill: skip fragments already covered by committed
+        # segments; only the remainder is built and appended (non-overlapping
+        # segments are appended, not swapped).
+        covered = existing_coverage & available_fragment_ids
+        already_covered = requested_fragment_ids & covered
+        to_build = requested_fragment_ids - covered
+        if already_covered:
+            logger.info(
+                "Fragments %s are already covered by index '%s'; skipping them.",
+                sorted(already_covered),
+                name,
+            )
+        if not to_build:
+            logger.info("All requested fragments are already covered by index '%s'; nothing to build.", name)
+            return
+        requested_fragment_ids = to_build
 
-    fragments = lance_ds.get_fragments()
-    fragment_ids_to_use = [fragment.fragment_id for fragment in fragments]
+    if requested_fragment_ids is not None:
+        fragments = [fragment for fragment in fragments if fragment.fragment_id in requested_fragment_ids]
+    fragment_ids_to_use = sorted(
+        requested_fragment_ids if requested_fragment_ids is not None else (f.fragment_id for f in fragments)
+    )
 
     # Adjust fragment grouping size
     if fragment_group_size is None:
@@ -232,8 +320,7 @@ def create_scalar_index_internal(
 
     # Configure maximum concurrency for fragment batches
     if not fragment_data:
-        logger.info("No fragments found for dataset at %s; skipping scalar index creation.", open_context.uri)
-        return
+        raise ValueError(f"Dataset at {open_context.uri} contains no fragments")
 
     logger.info(
         "Starting distributed scalar index creation: column=%s, type=%s, name=%s, fragment_group_size=%s, max_concurrency=%s",
@@ -250,7 +337,7 @@ def create_scalar_index_internal(
         index_type=index_type,
         name=name,
         fragment_data=fragment_data,
-        fragment_ids_to_use=fragment_ids_to_use,
+        expected_fragment_ids=fragment_ids_to_use,
         num_partitions=num_partitions,
         max_concurrency=max_concurrency,
         handler_replace=handler_replace,
@@ -265,7 +352,7 @@ def _create_segmented_index(
     index_type: str,
     name: str,
     fragment_data: list[dict[str, list[int]]],
-    fragment_ids_to_use: list[int],
+    expected_fragment_ids: list[int] | None = None,
     num_partitions: int | None,
     max_concurrency: int | None,
     handler_replace: bool = False,
@@ -316,6 +403,7 @@ def _create_segmented_index(
     # Reload dataset to pick up the latest version (segment files were written
     # by workers against the version that was current at their invocation time).
     lance_ds = open_context.open_latest()
+    _validate_segments_against_manifest(lance_ds, index_metas, expected_fragment_ids)
 
     logger.info(
         "Collected %d index segments; committing as segmented index %s",
@@ -325,3 +413,54 @@ def _create_segmented_index(
     lance_ds.commit_existing_index_segments(name, column, index_metas)
 
     logger.info("Segmented index %s committed successfully", name)
+
+
+def _validate_segments_against_manifest(
+    lance_ds: lance.LanceDataset,
+    index_metas: list[lance.Index | lance.indices.IndexSegment],
+    expected_fragment_ids: list[int] | None = None,
+) -> None:
+    """Validate worker-built segments before the commit.
+
+    Three checks, each failing loudly instead of committing a broken index:
+
+    - Dead fragments: a segment references a fragment ID that no longer exists
+      in the manifest (a concurrent compaction rewrote it while the index was
+      being built). Lance would still accept the commit and the index would
+      permanently reference dead fragment IDs.
+    - Overlapping coverage: two segments cover the same fragment. Every
+      fragment must be covered exactly once.
+    - Incomplete coverage (when ``expected_fragment_ids`` is given): the union
+      of the segments' coverage must equal the scheduled fragment set, so a
+      silently lost worker result cannot produce a partial index.
+    """
+    live_fragment_ids = {fragment.fragment_id for fragment in lance_ds.get_fragments()}
+    covered: set[int] = set()
+    duplicate_ids: set[int] = set()
+    dead_ids: set[int] = set()
+    for meta in index_metas:
+        for fragment_id in getattr(meta, "fragment_ids", None) or ():
+            if fragment_id in covered:
+                duplicate_ids.add(fragment_id)
+            covered.add(fragment_id)
+            if fragment_id not in live_fragment_ids:
+                dead_ids.add(fragment_id)
+    if dead_ids:
+        raise RuntimeError(
+            f"Cannot commit index segments: fragments {sorted(dead_ids)} no longer exist in the "
+            "dataset (they were most likely rewritten by a concurrent compaction while the index "
+            "was being built). Re-run the index build against the current dataset version."
+        )
+    if duplicate_ids:
+        raise RuntimeError(
+            f"Cannot commit index segments: fragments {sorted(duplicate_ids)} are covered by more "
+            "than one segment; every fragment must be covered exactly once."
+        )
+    if expected_fragment_ids is not None:
+        missing = set(expected_fragment_ids) - covered
+        if missing:
+            raise RuntimeError(
+                f"Cannot commit index segments: fragments {sorted(missing)} were scheduled but are "
+                "not covered by any built segment (a worker result was likely lost). Re-run the "
+                "index build."
+            )
