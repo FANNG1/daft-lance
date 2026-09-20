@@ -92,14 +92,16 @@ Struct columns are not supported: a source struct that omits one of the
 target's fields casts cleanly with that field set to null, which would silently
 drop data the caller never meant to overwrite.
 
-The source `_rowaddr` values must be unique, and they must identify live rows
-of the pinned target snapshot. Uniqueness is enforced; liveness is not. The
-rewrite is a left-outer join on `_rowaddr`, so an address that matches no live
-row updates nothing and raises nothing — it is still counted in
-`rows_updated`. Read the source from the snapshot you are updating (pass the
-same `version` if you pin one) rather than replaying an address list produced
-against an older snapshot. The update itself is committed atomically using
-Lance `RewriteColumns`.
+The source `_rowaddr` values must be unique and must identify live rows of the
+pinned target snapshot. Neither is checked, because the rewrite is a
+left-outer join on `_rowaddr` and both failures are expressible in it: an
+address matching no live row updates nothing, and a repeated address updates
+its row once with one of the submitted values, chosen by row order rather than
+by any rule. Both are silent, and both still count towards `rows_updated`.
+Read the source from the snapshot you are updating (pass the same `version` if
+you pin one) rather than replaying an address list produced against an older
+snapshot, and make sure an upstream join cannot fan a row address out. The
+update itself is committed atomically using Lance `RewriteColumns`.
 
 Stable-row-ID datasets are rejected before any fragments are written because
 current pylance bindings cannot propagate the offsets required to advance

@@ -160,20 +160,24 @@ def test_update_columns_df_empty_is_noop(tmp_path: Path) -> None:
     assert lance.dataset(path).version == version
 
 
-def test_update_columns_df_rejects_duplicate_addresses(tmp_path: Path) -> None:
+def test_update_columns_df_duplicate_address_keeps_one_value(tmp_path: Path) -> None:
+    """Lance picks one of the matching rows; which one is not specified."""
     path = str(tmp_path / "invalid-address.lance")
     daft.from_pydict({"id": [1, 2], "value": [10, 20]}).write_lance(path)
     version = lance.dataset(path).version
     source_data = {"_rowaddr": [0, 0], "fragment_id": [0, 0], "value": [100, 200]}
 
-    with pytest.raises(Exception, match="Duplicate _rowaddr"):
-        daft_lance.update_columns_df(
-            daft.from_pydict(cast(Any, source_data)),
-            path,
-            columns=["value"],
-        )
+    result = daft_lance.update_columns_df(
+        daft.from_pydict(cast(Any, source_data)),
+        path,
+        columns=["value"],
+    )
 
-    assert lance.dataset(path).version == version
+    assert result == daft_lance.UpdateColumnsResult(version=version + 1, rows_updated=2)
+    table = lance.dataset(path).to_table().sort_by("id").to_pydict()
+    assert table["id"] == [1, 2]
+    assert table["value"][0] in (100, 200)
+    assert table["value"][1] == 20
 
 
 def test_update_columns_df_ignores_out_of_range_address(tmp_path: Path) -> None:

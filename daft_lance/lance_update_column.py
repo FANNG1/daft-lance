@@ -35,7 +35,8 @@ class UpdateColumnsResult:
 
     ``rows_updated`` counts the rows the source submitted, not the rows Lance
     matched. They differ when the source carries a ``_rowaddr`` that is not a
-    live row of the pinned snapshot, which is silently ignored.
+    live row of the pinned snapshot, which is silently ignored, or the same
+    address more than once, which updates one row.
     """
 
     version: int
@@ -130,7 +131,11 @@ def _to_arrow_array(series: Any) -> pa.Array[Any]:
 
 
 def _prepare_fragment_update(columns: list[str], series: tuple[Any, ...]) -> _FragmentUpdateBatch:
-    """Validate and convert one Daft fragment group into Arrow inputs."""
+    """Convert one Daft fragment group into Arrow inputs.
+
+    Only nulls are rejected. Repeated addresses are left to Lance, which picks
+    one of the matching rows without specifying which.
+    """
     *update_series, row_address_series, fragment_id_series = series
     fragment_id_scalar = _to_arrow_array(fragment_id_series)[0]
     if not fragment_id_scalar.is_valid:
@@ -141,8 +146,6 @@ def _prepare_fragment_update(columns: list[str], series: tuple[Any, ...]) -> _Fr
     if row_addresses.null_count:
         raise ValueError("_rowaddr cannot contain nulls.")
     row_addresses = row_addresses.cast(pa.uint64(), safe=True)
-    if pa.compute.count_distinct(row_addresses).as_py() != len(row_addresses):
-        raise ValueError(f"Duplicate _rowaddr values found for fragment {fragment_id}.")
 
     values = pa.Table.from_arrays([_to_arrow_array(value) for value in update_series], names=columns)
     return _FragmentUpdateBatch(fragment_id, row_addresses, values)

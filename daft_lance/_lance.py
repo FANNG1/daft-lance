@@ -451,8 +451,10 @@ def update_columns_df(
         The committed dataset version, and the number of rows the source
         submitted. Row addresses are not checked against the target: the
         rewrite is a left-outer join, so a ``_rowaddr`` that is not a live row
-        of the pinned snapshot updates nothing, raises nothing, and is still
-        counted. Keep the source aligned with ``version`` to keep the count
+        of the pinned snapshot updates nothing, and a ``_rowaddr`` repeated in
+        the source updates its row once with an unspecified one of the
+        submitted values. Both are silent and both are still counted. Keep the
+        source aligned with ``version``, and unique, to keep the count
         meaningful.
 
     Note:
