@@ -413,7 +413,6 @@ def update_columns(
     block_size: int | None = None,
     commit_lock: Any | None = None,
     index_cache_size: int | None = None,
-    default_scan_options: dict[str, Any] | None = None,
     metadata_cache_size_bytes: int | None = None,
     max_concurrency: int | None = None,
 ) -> UpdateColumnsResult:
@@ -445,7 +444,6 @@ def update_columns(
         block_size: Hint for the minimum object-store I/O request size.
         commit_lock: Custom Lance commit lock.
         index_cache_size: Index cache size.
-        default_scan_options: Default Lance scan options.
         metadata_cache_size_bytes: Metadata cache size in bytes.
         max_concurrency: Maximum number of concurrent fragment-update workers.
 
@@ -506,7 +504,6 @@ def update_columns(
         block_size=block_size,
         commit_lock=commit_lock,
         index_cache_size=index_cache_size,
-        default_scan_options=default_scan_options,
         metadata_cache_size_bytes=metadata_cache_size_bytes,
     )
     return update_columns_with_transform(
@@ -536,7 +533,6 @@ def update_columns_df(
     block_size: int | None = None,
     commit_lock: Any | None = None,
     index_cache_size: int | None = None,
-    default_scan_options: dict[str, Any] | None = None,
     metadata_cache_size_bytes: int | None = None,
     max_concurrency: int | None = None,
 ) -> UpdateColumnsResult:
@@ -567,7 +563,6 @@ def update_columns_df(
         block_size: Block size in bytes. Provide a hint for the size of the minimal I/O request.
         commit_lock: Custom Lance commit lock.
         index_cache_size: Index cache size.
-        default_scan_options: Default scan options.
         metadata_cache_size_bytes: Size of the metadata cache in bytes.
         max_concurrency: Maximum number of concurrent fragment-update workers.
 
@@ -616,7 +611,6 @@ def update_columns_df(
         block_size=block_size,
         commit_lock=commit_lock,
         index_cache_size=index_cache_size,
-        default_scan_options=default_scan_options,
         metadata_cache_size_bytes=metadata_cache_size_bytes,
     )
     return update_columns_from_df(
