@@ -414,6 +414,57 @@ Native namespace support in `daft.read_lance` / `DataFrame.write_lance` is track
 [Eventual-Inc/Daft#7282](https://github.com/Eventual-Inc/Daft/issues/7282); until that lands,
 use the `daft_lance` entry points shown above for namespace-addressed tables.
 
+### Shared Lance caches
+
+Daft-Lance lazily creates one automatically managed Lance Session per process,
+shared by all tables for dataset opens and `write_fragments` calls. Tasks carry
+serializable open arguments; the native Session is created in the worker.
+Dataset and network operations run outside the Session initialization lock.
+
+Configure cache capacities in bytes in the driver and worker environments:
+
+```bash
+export DAFT_LANCE_METADATA_CACHE_SIZE_BYTES=1073741824
+export DAFT_LANCE_INDEX_CACHE_SIZE_BYTES=268435456
+```
+
+The first Session initialization fixes the process-wide capacities: explicit
+read sizes take precedence over environment defaults, then Lance defaults.
+Later calls without explicit sizes use these fixed capacities; conflicting
+explicit sizes fail clearly instead of being silently ignored. Set the same
+capacity environment variables in driver and workers before first use. Capacity
+environment changes require restarting the process or calling the internal
+`clear_caches()` helper. Legacy `index_cache_size` uses pylance's conversion of
+20 MiB per entry. Explicit externally supplied Sessions are preserved.
+
+Capacities are shared across tables within a process, not multiplied per table.
+Each worker has its own budget. All users of the global Session must agree that
+a URI identifies the same dataset; identical URIs addressing different data on
+different endpoints require separate processes or explicitly isolated Sessions.
+Storage options and namespace credentials continue to be passed to each open
+and write operation.
+
+Each operation opens its own Dataset while reusing a Session. There is no
+Dataset cache or special handling for V1 manifest naming. Manifest and index
+cache admission, identity, and eviction are managed by Lance itself; the intended
+metadata-reuse path uses V2 manifest naming.
+
+`DAFT_LANCE_CACHE_TTL_SECONDS` controls idle Session retention (default 300
+seconds) and requires a positive integer. Byte capacities require nonnegative
+integers. Invalid settings report the variable name and value.
+
+A process-local daemon sweeps the global Session every 30 seconds, including
+when the worker receives no further requests. An idle Session can remain for
+up to TTL plus one sweep interval. Cleanup drops the global reference without
+closing handles held by active tasks. A later open recreates the Session with
+the same fixed capacities; explicit `clear_caches()` also resets configuration.
+Fork resets the Session, configuration, lock, and cleanup thread. Native
+allocators may retain memory after references are released, so TTL is not an
+RSS limit. There is no Session LRU pool or per-key Future.
+
+Worker reads retain their pinned version, while operations opening latest
+still resolve the current version.
+
 ## Migration
 
 The migration only requires replacing `daft.io.lance` with `daft_lance`.
